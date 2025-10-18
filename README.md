@@ -37,8 +37,17 @@ python morphology_gen.py --dataroot ${dataroot} --model${model} --device ${devic
 ```
 
 ## Citation
-If you find this repository useful, please cite our paper:
-
-
+If you find this repository useful, please cite our paper:  
+```
+InProceedings{Zhu_2025_ICCV,  
+    author    = {Zhu, Tianfang and Zhou, Hongyang and Li, Anan},  
+    title     = {MorphoGen: Efficient Unconditional Generation of Long-Range Projection Neuronal Morphology via a Global-to-Local Framework},  
+    booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},  
+    month     = {October},  
+    year      = {2025},  
+    pages     = {13021-13031}  
+}
+``` 
+  
 ## Acknowledgement
 Thanks for the wonderful work [DiT-3D](https://github.com/DiT-3D/DiT-3D).
