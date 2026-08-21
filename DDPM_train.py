@@ -14,7 +14,9 @@ from collections import OrderedDict
 from models.dit3d import DiT3D_models
 from models.dit3d_window_attn import DiT3D_models_WindAttn
 from tensorboardX import SummaryWriter
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+# NOTE: upstream hardcoded os.environ["CUDA_VISIBLE_DEVICES"] = "2" here, which pins
+# training to GPU 2 regardless of the host. Drive device selection from the
+# environment instead (export CUDA_VISIBLE_DEVICES=... before launching).
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -544,7 +546,9 @@ def get_dataloader(opt, train_dataset, test_dataset=None):
                                                    shuffle=train_sampler is None, num_workers=int(opt.workers), drop_last=True)
 
     if test_dataset is not None:
-        test_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs,sampler=test_sampler,
+        # BUGFIX: upstream passed `train_dataset` here, so any validation would have
+        # been computed on training data.
+        test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=opt.bs,sampler=test_sampler,
                                                    shuffle=False, num_workers=int(opt.workers), drop_last=False)
     else:
         test_dataloader = None
@@ -883,7 +887,7 @@ def parse_args():
     parser.add_argument('--distribution_type', default='single')
     parser.add_argument('--model_type', default='DiT-S/4')
     parser.add_argument('--niter', type=int, default=40000, help='number of epochs to train for')
-    parser.add_argument('--bs', default=400)
+    parser.add_argument('--bs', type=int, default=400)  # BUGFIX: was untyped, so CLI overrides arrived as str
     parser.add_argument('--voxel_size', default=32)
     parser.add_argument('--lr', default=1e-4)
     parser.add_argument('--use_tb', action='store_true', default=True, help = 'use tensorboard')

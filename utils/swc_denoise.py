@@ -247,7 +247,10 @@ def parse_denoise_args():
     parser.add_argument('--denoise_dir', default=r'')
     parser.add_argument('--wind_len', default=4)
 
-    args = parser.parse_args()
+    # BUGFIX: was parser.parse_args(), which parses sys.argv. This function is called
+    # from inside generate_eval(), so any morphology_gen.py flag (--dataroot, --model, ...)
+    # triggered SystemExit(2) "unrecognized arguments" mid-generation.
+    args, _unknown = parser.parse_known_args()
     return args
 def neuron_denoise(neuron):
     ############### log init ###############

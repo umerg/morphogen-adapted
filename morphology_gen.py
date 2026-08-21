@@ -18,6 +18,8 @@ from datasets.shapenet_data_pc import ShapeNet15kPointClouds
 from models.dit3d import DiT3D_models
 from utils.misc import Evaluator
 import numpy as np
+import warnings
+import json
 from scipy.spatial import distance_matrix, KDTree
 from utils.ske_connect import *
 import heapq
@@ -416,21 +418,52 @@ def get_dataloader(opt, train_dataset, test_dataset=None):
                                                    shuffle=train_sampler is None, num_workers=int(opt.workers), drop_last=True)
 
     if test_dataset is not None:
-        test_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs,sampler=test_sampler,
+        # BUGFIX: upstream passed `train_dataset` here, so generation ran over the
+        # TRAIN split rather than the held-out split.
+        test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=opt.bs,sampler=test_sampler,
                                                    shuffle=False, num_workers=int(opt.workers), drop_last=False)
     else:
         test_dataloader = None
 
     return train_dataloader, test_dataloader, train_sampler, test_sampler
 
-def neuron_swc_generator(skeleton, soma_radius=5.0):
+def neuron_swc_generator(skeleton, soma_radius=5.0, detect_radius=None, root_cap=2,
+                         n_root_children=None, stem_sep=0.7,
+                         gamma_seed=1.0, gamma_main=1.2, seed_direction=None):
+    """Reconstruct a tree from skeleton points.
+
+    `soma_radius` is written into the SWC radius column for the soma node and is
+    a physical value in microns (5.0 um is anatomically sensible). Upstream also
+    reused it as the density-detection radius -- but the skeleton reaching this
+    function has been through pc_normlize(), so it lives on the unit sphere where
+    the maximum pairwise distance is <= 2. A 5.0 query radius therefore returned
+    EVERY point for every candidate, all densities tied, and np.argmax returned
+    index 0, i.e. whatever point fps() happened to seed with. The root was
+    effectively random.
+
+    `detect_radius` separates the two roles. Express 5 um in normalized space as
+    5.0 / m, where m is the neuron's max radial norm before normalization; for
+    the MICrONS cortical corpus median m ~ 244 um, giving ~0.02, which is also
+    where soma-placement error is empirically minimised.
+
+    `root_cap` restores the behaviour described in the paper (Sec. 4.2): "each
+    bifurcation, EXCLUDING THE SOMA, is limited to a maximum of two child
+    branches". Upstream applied the cap to node 0 as well.
+    """
 
     def detect_soma(points, radius):
         tree = KDTree(points)
         densities = np.array([len(tree.query_ball_point(p, radius)) for p in points])
+        if densities.max() == densities.min():
+            warnings.warn(
+                'detect_soma: all local densities are identical at radius={:g} on data '
+                'of extent {:g} -- the soma is being chosen arbitrarily. Pass a '
+                'detect_radius appropriate to the coordinate scale.'.format(
+                    radius, float(np.ptp(points, axis=0).max())),
+                RuntimeWarning, stacklevel=2)
         return points[np.argmax(densities)]
 
-    soma_center = detect_soma(skeleton, soma_radius)
+    soma_center = detect_soma(skeleton, soma_radius if detect_radius is None else detect_radius)
 
 
     class NeuronTree:
@@ -464,16 +497,82 @@ def neuron_swc_generator(skeleton, soma_radius=5.0):
     tree = NeuronTree(soma_center)
     candidate_edges = []
     dists = distance_matrix([soma_center], skeleton)[0]
-    for i, d in enumerate(dists):
-        if d > 0:
-            direction = skeleton[i] - soma_center
-            cos_sim = np.dot(direction, tree.direction) / (np.linalg.norm(direction) + 1e-6)
-            heapq.heappush(candidate_edges, (d * (1.0 - cos_sim), 0, i))  
-
 
     visited = set([0])
     skeleton_flags = np.zeros(len(skeleton), dtype=bool)
-    skeleton_flags[np.argmin(dists)] = True  
+    skeleton_flags[np.argmin(dists)] = True
+
+    if n_root_children and n_root_children > 1:
+        # --- explicit multi-stem seeding -------------------------------------
+        # The greedy loop below cannot grow a realistic soma on its own. Soma edges
+        # are priced ONCE, at init, while `tree.direction` is still zeros, so they
+        # never receive the directional discount that every frontier edge gets:
+        #     soma edge     = d * (1.0 - 0)        = 1.0*d      (fixed forever)
+        #     frontier edge = d * (1.2 - cos_sim)  = 0.2..2.2*d (re-priced each step)
+        # An aligned frontier edge is therefore ~5x cheaper than any soma edge at
+        # the same distance, so after its first child the soma essentially never
+        # wins another contest -- root degree collapses to 1-3 regardless of the cap.
+        # Seeding the k stems directly sidesteps the pricing asymmetry entirely.
+        #
+        # Stems are chosen by DIRECTION, not proximity: real primary dendrites leave
+        # the soma on distinct bearings, whereas the k nearest points typically all
+        # sit on one dendrite.
+        shell = np.argsort(dists)[1:max(n_root_children * 12, 60)]
+        vecs = skeleton[shell] - soma_center
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        unit = vecs / np.maximum(norms, 1e-9)
+
+        order = sorted(zip(shell, unit), key=lambda t: dists[t[0]])
+        picked = []
+        # Progressively relax the bearing-separation requirement until k stems are
+        # found. A fixed threshold silently under-delivers on neurons whose stems
+        # leave at shallow angles, which would reintroduce the very bias we are
+        # trying to remove.
+        sep = stem_sep
+        while len(picked) < n_root_children and sep < 0.99:
+            for idx, u in order:
+                if len(picked) >= n_root_children:
+                    break
+                if idx in {j for j, _ in picked}:
+                    continue
+                if all(float(np.dot(u, pu)) < sep for _, pu in picked):
+                    picked.append((idx, u))
+            sep += 0.1
+
+        for idx, _ in picked:
+            if skeleton_flags[idx]:
+                continue
+            tree.add_node(0, skeleton[idx])
+            nid = tree.current_id - 1
+            visited.add(nid)
+            skeleton_flags[idx] = True
+            npos = skeleton[idx]
+            nd = distance_matrix([npos], skeleton)[0]
+            for i, d in enumerate(nd):
+                if not skeleton_flags[i] and d > 0:
+                    heapq.heappush(candidate_edges, (d * 1.2, nid, i))
+        # the soma is now fully populated; the loop must not add more stems
+        root_cap = len(tree.nodes[0]['children'])
+
+    # Soma edges are priced ONCE, here, and never re-priced. Upstream did so with
+    # `tree.direction` still zeros, so cos_sim == 0 and every soma edge is charged the
+    # full gamma_seed*d -- while frontier edges, re-pushed with the live direction, can
+    # be discounted to (gamma_main-1)*d. `seed_direction='cloud'` estimates d_g from the
+    # skeleton's principal axis instead, which is what the paper's
+    # "current principal morphological direction" reduces to when the tree is one node.
+    seed_dir = tree.direction
+    if seed_direction == 'cloud' and len(skeleton) > 2:
+        seed_dir = PCA(n_components=1).fit(skeleton).components_[0]
+
+    for i, d in enumerate(dists):
+        if d > 0 and not skeleton_flags[i]:
+            edge = skeleton[i] - soma_center
+            cos_sim = np.dot(edge, seed_dir) / (np.linalg.norm(edge) + 1e-6)
+            # |cos_sim| so a stem is cheap whether it leaves along +d_g or -d_g;
+            # a signed term would price the basal stems out of contention entirely.
+            if seed_direction == 'cloud':
+                cos_sim = abs(cos_sim)
+            heapq.heappush(candidate_edges, (d * (gamma_seed - cos_sim), 0, i))
 
     while candidate_edges:
         weight, parent_id, skel_idx = heapq.heappop(candidate_edges)
@@ -482,7 +581,10 @@ def neuron_swc_generator(skeleton, soma_radius=5.0):
             continue
 
 
-        if len(tree.nodes[parent_id]['children']) >= 2:
+        # Paper Sec. 4.2: the cap applies to bifurcations "excluding the soma".
+        # Upstream applied it to node 0 too, forcing every generated soma to have
+        # at most 2 primary dendrites (real somata have 3-23).
+        if len(tree.nodes[parent_id]['children']) >= (root_cap if parent_id == 0 else 2):
             continue
 
 
@@ -504,7 +606,7 @@ def neuron_swc_generator(skeleton, soma_radius=5.0):
                     cos_sim = np.dot(direction, tree.direction) / (np.linalg.norm(direction) + 1e-6)
                 else:
                     cos_sim = 0
-                heapq.heappush(candidate_edges, (d * (1.2 - cos_sim), current_id, i))
+                heapq.heappush(candidate_edges, (d * (gamma_main - cos_sim), current_id, i))
 
     swc_data = []
     for nid, node in tree.nodes.items():
@@ -636,12 +738,24 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
     _, test_dataloader, _, test_sampler = get_dataloader(opt, test_dataset, test_dataset)
 
     aux_model = ResNet18()
-    aux_model.load_state_dict(torch.load('./temp/resnet16model.pth'))
+    # BUGFIX: upstream pointed at './temp/resnet16model.pth', which is not in the release.
+    # The shipped auxiliary weight is trained_model/Auxiliary.pth (resolved relative to
+    # this file so the CWD does not matter). Override with --aux_model.
+    _aux_ckpt = getattr(opt, 'aux_model', '') or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), 'trained_model', 'Auxiliary.pth')
+    aux_model.load_state_dict(torch.load(_aux_ckpt, map_location='cpu'))
     aux_model.eval()
 
     def new_y_chain(device, num_chain, num_classes):
         return torch.randint(low=0,high=num_classes,size=(num_chain,),device=device)
     
+    # The dataset applies a deterministic shuffle (random.Random(38383)), so the i-th
+    # generated sample is NOT the i-th file of the split. Downstream evaluation pairs
+    # gen[i] with a filename-sorted ground-truth list, so naming outputs by a running
+    # counter silently pairs every neuron with an arbitrary other one. Name each output
+    # by its source `mid` and emit a manifest so the join is explicit.
+    manifest = []
+
     with torch.no_grad():
 
         samples = []
@@ -650,18 +764,27 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
             x = data['test_points'].transpose(1,2)
             m, s = data['mean'].float(), data['std'].float()
             y = data['cate_idx']
+            mids = data['mid']
+            sids = data['sid']
             gen = model.gen_samples(x.shape, gpu, new_y_chain(gpu,y.shape[0],opt.num_classes), clip_denoised=False).detach().cpu()
             gen = gen.transpose(1,2).contiguous()
             x = x.transpose(1,2).contiguous()
 
             gen = gen * s + m  #torch.Size([2, 2048, 3])
             x = x * s + m
-            for pc in gen: #torch.Size([2048, 3])
+            for j, pc in enumerate(gen): #torch.Size([2048, 3])
                 points = pc.numpy()
                 point_swc_L1 = L1_medial(points=points, NCenters=2048,iters=1)
-                ske = point_swc_L1[fps(point_swc_L1, 1200), :] #(1200,3)
+                # Seed fps per-sample so the reconstruction is reproducible.
+                ske = point_swc_L1[fps(point_swc_L1, 1200, seed=opt.manualSeed + a), :] #(1200,3)
                 ###
-                connect = neuron_swc_generator(ske) #(1200, 7)
+                connect = neuron_swc_generator(
+                    ske,
+                    detect_radius=getattr(opt, 'detect_radius', None),
+                    root_cap=getattr(opt, 'root_cap', 2),
+                    gamma_seed=getattr(opt, 'gamma_seed', 1.0),
+                    gamma_main=getattr(opt, 'gamma_main', 1.2),
+                ) #(1200, 7)
                 ###
                 cut = [
                     {
@@ -675,17 +798,39 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
                     }
                     for row in connect
                 ]  #[1200,7]
-                cut = filter_short_branches(cut, length_threshold=0.1) ##[1200,7]
+                cut = filter_short_branches(
+                    cut, length_threshold=getattr(opt, 'length_threshold', 0.1)) ##[1200,7]
                 cut = pd.DataFrame(cut)
                 nodes = auxi(cut,aux_model)
-                file_path = os.path.join(opt.generate_dir, f"pc_{a}.swc")
-                print(f"pc_{a}.swc")
-                a = a + 1                 
+
+                # Name by the SOURCE neuron, not by generation order (see manifest note above).
+                mid = mids[j] if isinstance(mids, (list, tuple)) else mids[j]
+                stem = str(mid).replace('/', '__')
+                fname = f"{stem}.swc"
+                file_path = os.path.join(opt.generate_dir, fname)
+                manifest.append({
+                    'file': fname,
+                    'mid': str(mid),
+                    'sid': str(sids[j] if isinstance(sids, (list, tuple)) else sids[j]),
+                    'cate_idx': int(y[j]),
+                    'gen_index': a,
+                    'mean': [float(v) for v in m[j].flatten()],
+                    'std': float(s[j].flatten()[0]),
+                })
+                a = a + 1
                 with open(file_path, 'w') as f:
                     for node in nodes:
                         node_str = " ".join(map(str, node))
                         f.write(node_str + "\n")
-    return output_dir
+
+    # Explicit generated -> source join for the evaluation harness.
+    with open(os.path.join(opt.generate_dir, 'manifest.json'), 'w') as f:
+        json.dump(manifest, f, indent=1)
+    print(f"wrote {len(manifest)} neurons + manifest.json to {opt.generate_dir}")
+    # BUGFIX: upstream returned `output_dir`, which is not defined in this scope --
+    # a NameError raised AFTER the entire (very expensive) generation loop, discarding
+    # the run. `outf_syn` is the directory this function actually writes under.
+    return outf_syn
 
 
 def main(opt):
@@ -825,6 +970,29 @@ def parse_args():
     '''eval'''
     parser.add_argument('--eval_path',default='')
     parser.add_argument('--manualSeed', default=42, type=int, help='random seed')
+    # --- reconstruction controls (see neuron_swc_generator docstring) ---
+    parser.add_argument('--detect_radius', default=None, type=float,
+                        help='soma density-detection radius in NORMALIZED units. The shipped '
+                             'code reused --soma_radius (5.0 um) here, which exceeds the unit-sphere '
+                             'extent and makes every density tie, so the root became arbitrary. '
+                             'Use 5.0/m where m is the max radial norm before pc_normlize '
+                             '(~0.02 for the MICrONS cortical corpus).')
+    parser.add_argument('--root_cap', default=2, type=int,
+                        help='max children allowed on the soma. Paper Sec. 4.2 exempts the soma '
+                             'from the 2-child rule; the released code did not. Set e.g. 23 to '
+                             'restore the documented behaviour.')
+    parser.add_argument('--length_threshold', default=0.1, type=float,
+                        help='filter_short_branches threshold, in NORMALIZED units.')
+    parser.add_argument('--aux_model', default='', type=str,
+                        help='auxiliary CNN checkpoint (default: trained_model/Auxiliary.pth)')
+    parser.add_argument('--gamma_seed', default=1.0, type=float,
+                        help='directional coefficient for SOMA edges. Shipped value 1.0 leaves '
+                             'soma edges uncompetitive against the discounted frontier edges, so '
+                             'root degree collapses to 1-2 (GT median 7). Calibrated on train, '
+                             '0.40 matches the GT median stem count and basal fraction '
+                             '-- the MorphoGen+ arm.')
+    parser.add_argument('--gamma_main', default=1.2, type=float,
+                        help="frontier-edge directional coefficient; the paper's stated gamma.")
     parser.add_argument('--model_dir', type=str, default=r'/mnt/d/hyzhou/point cloud/temp', help='path to save trained model weights')
     parser.add_argument('--experiment_name', type=str, default='ct', help='experiment name (used for checkpointing and logging)')
     parser.add_argument('--category', default='it')

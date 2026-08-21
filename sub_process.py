@@ -49,6 +49,19 @@ def zDataClean(swc):
 
 
 def getBranch(swc):
+    """Split an SWC laid out in depth-first order into branch polylines.
+
+    Returns a list of branches, each a list of ROW indices into `swc`.
+
+    BUGFIX: upstream mapped a node id to its row with `int(id) - 1`, which silently
+    assumes 1-based contiguous ids. Corpora exported with 0-based ids (e.g. the
+    MICrONS raw skeletons, where row index == id and the soma is id 0) then had every
+    branch start on the WRONG two nodes -- fabricating long segments across the
+    neuron, which uni_sampling_up() subsequently interpolated points along. Nothing
+    downstream would surface this. Build an explicit id -> row map instead.
+    """
+    id2row = {int(swc[i, 0]): i for i in range(len(swc))}
+
     branch_list = []
     branch = []
     for j in range(len(swc)):
@@ -56,15 +69,18 @@ def getBranch(swc):
             branch.append(j)
             continue
         if swc[j, 6] == swc[j - 1, 0]:
-            # print(swc[j,6])
             branch.append(j)
             if j == len(swc) - 1:
                 branch_list.append(branch)
         else:
-            branch_list.append(branch)
-            branch = []
-            branch.append(int(swc[j, 6]) - 1)
-            branch.append(int(swc[j, 0]) - 1)
+            # A new branch starts here: it hangs off this node's parent.
+            if branch:
+                branch_list.append(branch)
+            parent_row = id2row.get(int(swc[j, 6]))
+            branch = [] if parent_row is None else [parent_row]
+            branch.append(j)
+            if j == len(swc) - 1:
+                branch_list.append(branch)
             continue
     return branch_list
 
@@ -133,19 +149,25 @@ def pc_normalize(pc):
     pc = pc / m
     return pc
 
-def farthest_point_sample_faster(pts: np.array, num: int) -> np.array:
+def farthest_point_sample_faster(pts: np.array, num: int, seed=None) -> np.array:
     """
     Input:
         xyz: pointcloud data, [B, N, 3]
         npoint: number of samples
     Return:
         centroids: sampled pointcloud index, [B, npoint]
+
+    BUGFIX: `np.compat.long` was removed in NumPy 2.x, so this raised AttributeError
+    on any modern install. Also the FPS start index was drawn from an unseeded global
+    RNG, making the baked point clouds irreproducible; `seed` makes it deterministic.
     """
     pc1 = np.expand_dims(pts, axis=0)   # 1, N, 3
     batchsize, npts, dim = pc1.shape
-    centroids = np.zeros((batchsize, num), dtype=np.compat.long)
+    centroids = np.zeros((batchsize, num), dtype=np.int64)
     distance = np.ones((batchsize, npts)) * 1e10
-    farthest_id = np.random.randint(0, npts, (batchsize,), dtype=np.compat.long)
+    _rng = np.random.default_rng(seed) if seed is not None else np.random
+    farthest_id = (_rng.integers(0, npts, (batchsize,)) if seed is not None
+                   else np.random.randint(0, npts, (batchsize,))).astype(np.int64)
     batch_index = np.arange(batchsize)
     for i in range(num):
         centroids[:, i] = farthest_id

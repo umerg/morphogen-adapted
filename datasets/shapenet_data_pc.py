@@ -11,6 +11,13 @@ import torch.nn.functional as F
 # taken from https://github.com/optas/latent_3d_points/blob/8e8f29f8124ed5fc59439e8551ba7ef7567c9a37/src/in_out.py
 synsetid_to_cate = {
     'm1_15000':'m1','it':'it','ct':'ct','pt':'pt',
+    # MICrONS cortical dendrites (see tools/swc_to_morphogen_npy.py).
+    # The loader globs <root>/<synset>/<split>/*.npy and derives the conditioning
+    # label from the synset INDEX, so the unconditional arm uses one synset and the
+    # class-conditional arm uses one synset per cell class.
+    'neurons':'neurons',
+    'class_0':'class_0', 'class_1':'class_1', 'class_2':'class_2', 'class_3':'class_3',
+    'class_4':'class_4', 'class_5':'class_5', 'class_6':'class_6',
 }
 cate_to_synsetid = {v: k for k, v in synsetid_to_cate.items()}
 

@@ -120,11 +120,19 @@ def minTree(swcpath, swcdata=None):
     return T.edges, connect
 
 
-def fps(pc, npoint):
+def fps(pc, npoint, seed=None):
     N = pc.shape[0]
     centroids = np.zeros(npoint, dtype=np.int64)
     distance_ = np.ones(N) * 1e10
-    farthest = np.random.randint(0, npoint, dtype=int)
+    # BUGFIX (two issues):
+    #  1. the seed index was drawn from an UNSEEDED global RNG, making the whole
+    #     reconstruction non-reproducible -- and because detect_soma() degenerates
+    #     (see neuron_swc_generator), centroids[0] became the tree's root, so the
+    #     soma was effectively a uniformly random point.
+    #  2. the upper bound was `npoint` (the number of samples) rather than `N`
+    #     (the number of points), so indices >= npoint could never seed the walk.
+    rng = np.random.default_rng(seed) if seed is not None else np.random
+    farthest = int(rng.integers(0, N)) if seed is not None else int(np.random.randint(0, N))
     for i in range(npoint):
         centroids[i] = farthest
         centroid = pc[farthest, :]
@@ -209,7 +217,7 @@ def nms_swc_sphere(radius, obj_score, xyz, overlap_threshold=0.25):
     return np.array(pick)
 
 
-def L1_medial(points, NCenters=1000, iters=4):
+def L1_medial(points, NCenters=1000, iters=4, seed=None):
 
     maxPoints = 5000
     try_make_skeleton = False
@@ -222,7 +230,14 @@ def L1_medial(points, NCenters=1000, iters=4):
     h = h0
 
     random.seed(16)
-    random_centers = np.random.choice(range(0, len(points)), NCenters)
+    # BUGFIX: `random.seed(16)` seeds the STDLIB rng, but the center initialisation
+    # below draws from the NUMPY GLOBAL rng, which numpy seeds from OS entropy at
+    # process start. L1_medial was therefore non-deterministic run-to-run, making the
+    # whole reconstruction irreproducible (two runs on identical input gave different
+    # skeletons, and hence different trees). Use an explicit generator.
+    _rng = np.random.default_rng(seed) if seed is not None else np.random
+    random_centers = (_rng.choice(len(points), NCenters) if seed is not None
+                      else np.random.choice(range(0, len(points)), NCenters))
     centers = points[random_centers, :]
 
     myCenters = L1.MyCenters(centers, h, maxPoints = NCenters)

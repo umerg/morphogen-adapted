@@ -69,6 +69,13 @@ def filter_short_branches(swc_data, length_threshold=20):
         if length < length_threshold:
             to_remove.update(path)
 
+    # BUGFIX: calculate_path_length walks up until it hits a node with >1 children,
+    # so when the root has exactly one child and the chain is short, the ROOT lands
+    # in `path` and gets deleted. The result has no parent<=0 node, and downstream
+    # SWC readers then report root=None. Never remove a root.
+    roots = {node['n'] for node in swc_data if node['parent'] not in node_dict}
+    to_remove -= roots
+
     preserved = [node for node in swc_data if node['n'] not in to_remove]
 
     id_map = {node['n']: i + 1 for i, node in enumerate(preserved)}
