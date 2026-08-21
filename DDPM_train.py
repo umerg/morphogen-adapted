@@ -807,8 +807,30 @@ def train(gpu, opt, output_dir, noises_init):
 
     dist.destroy_process_group()
 
+
+def _require_dataroot(opt):
+    """Fail loudly and early on an unset/missing dataroot.
+
+    The loader silently skips files it cannot read, so a wrong path yields an empty
+    dataset and a training loop that appears to run while doing nothing.
+    """
+    import sys as _sys
+    from pathlib import Path as _P
+    if not opt.dataroot:
+        _sys.exit('--dataroot is not set. Pass it, or export MORPHOGEN_DATAROOT=/path/to/npy_root')
+    for cate in str(opt.category).split(','):
+        d = _P(opt.dataroot) / cate.strip()
+        if not d.is_dir():
+            _sys.exit(f'no such synset directory: {d}\n'
+                      f'  expected <dataroot>/<category>/{{train,val,test}}/*.npy\n'
+                      f'  dataroot={opt.dataroot!r} category={opt.category!r}')
+        if not list((d / 'train').glob('*.npy')) and not list((d / 'val').glob('*.npy')):
+            _sys.exit(f'{d} contains no .npy under train/ or val/ '
+                      '-- run tools/swc_to_morphogen_npy.py first')
+
 def main():
     opt = parse_args()
+    _require_dataroot(opt)
     if opt.category == 'airplane':
         opt.beta_start = 1e-5
         opt.beta_end = 0.008
@@ -892,10 +914,19 @@ def parse_args():
     parser.add_argument('--lr', default=1e-4)
     parser.add_argument('--use_tb', action='store_true', default=True, help = 'use tensorboard')
     parser.add_argument('--model', default='', help="path to model (to continue training)")
-    parser.add_argument('--dataroot', default=r"/data/mosthyzhou/data/it")
-    parser.add_argument('--category', default='it')
+# Data paths default from the environment so a forgotten flag fails loudly instead of
+# silently falling back to the original authors' cluster layout. Set once:
+#   export MORPHOGEN_DATAROOT=/scratch/$USER/morphogen_npy
+#   export MORPHOGEN_RUNS=/scratch/$USER/mg_runs
+#   export MORPHOGEN_GENDIR=/scratch/$USER/mg_gen
+    parser.add_argument('--dataroot', default=os.environ.get('MORPHOGEN_DATAROOT', ''),
+                        help='root holding <synset>/{train,val,test}/*.npy (env: MORPHOGEN_DATAROOT)')
+    parser.add_argument('--category', default=os.environ.get('MORPHOGEN_CATEGORY', 'neurons'),
+                        help="synset name(s), comma-separated. 'neurons' for the unconditional "
+                             "arm; 'class_0,...,class_6' for the class-conditional arm.")
     parser.add_argument('--experiment_name', default=r'it')    
-    parser.add_argument('--model_dir', type=str, default='/data/mosthyzhou/dit_test', help='path to save trained model weights')    
+    parser.add_argument('--model_dir', type=str, default=os.environ.get('MORPHOGEN_RUNS', './runs'),
+                        help='where checkpoints and logs go (env: MORPHOGEN_RUNS)')    
     opt = parser.parse_args()
 
     return opt

@@ -3,3 +3,8 @@ __pycache__/
 .DS_Store
 *.npy
 *.egg-info/
+
+# run outputs (DDPM_train copy_source()s itself into model_dir)
+runs/
+generated/
+outputs/

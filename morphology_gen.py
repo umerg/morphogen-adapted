@@ -833,7 +833,29 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
     return outf_syn
 
 
+
+def _require_dataroot(opt):
+    """Fail loudly and early on an unset/missing dataroot.
+
+    The loader silently skips files it cannot read, so a wrong path yields an empty
+    dataset and a training loop that appears to run while doing nothing.
+    """
+    import sys as _sys
+    from pathlib import Path as _P
+    if not opt.dataroot:
+        _sys.exit('--dataroot is not set. Pass it, or export MORPHOGEN_DATAROOT=/path/to/npy_root')
+    for cate in str(opt.category).split(','):
+        d = _P(opt.dataroot) / cate.strip()
+        if not d.is_dir():
+            _sys.exit(f'no such synset directory: {d}\n'
+                      f'  expected <dataroot>/<category>/{{train,val,test}}/*.npy\n'
+                      f'  dataroot={opt.dataroot!r} category={opt.category!r}')
+        if not list((d / 'train').glob('*.npy')) and not list((d / 'val').glob('*.npy')):
+            _sys.exit(f'{d} contains no .npy under train/ or val/ '
+                      '-- run tools/swc_to_morphogen_npy.py first')
+
 def main(opt):
+    _require_dataroot(opt)
     output_dir = get_output_dir(opt.generate_dir, opt.experiment_name)
     copy_source(__file__, output_dir)
 
@@ -995,13 +1017,21 @@ def parse_args():
                         help="frontier-edge directional coefficient; the paper's stated gamma.")
     parser.add_argument('--model_dir', type=str, default=r'/mnt/d/hyzhou/point cloud/temp', help='path to save trained model weights')
     parser.add_argument('--experiment_name', type=str, default='ct', help='experiment name (used for checkpointing and logging)')
-    parser.add_argument('--category', default='it')
+    parser.add_argument('--category', default=os.environ.get('MORPHOGEN_CATEGORY', 'neurons'),
+                        help="synset name(s); must match what was used for training")
     parser.add_argument('--bs', type=int, default=2, help='input batch size')
     parser.add_argument("--model_type", type=str, choices=list(DiT3D_models.keys()), default="DiT-S/4")
     parser.add_argument("--voxel_size", type=int, choices=[16, 32, 64], default=32)
-    parser.add_argument('--model', default=r'/data/mosthyzhou/dit_a100/temp/epoch_39999.pth', help="path to model (to continue training)")
-    parser.add_argument('--generate_dir', default=r'/data/mosthyzhou/dit_a100/temp/swc')
-    parser.add_argument('--dataroot', default=r"/data/mosthyzhou/data/it")
+# Data paths default from the environment so a forgotten flag fails loudly instead of
+# silently falling back to the original authors' cluster layout. Set once:
+#   export MORPHOGEN_DATAROOT=/scratch/$USER/morphogen_npy
+#   export MORPHOGEN_RUNS=/scratch/$USER/mg_runs
+#   export MORPHOGEN_GENDIR=/scratch/$USER/mg_gen
+    parser.add_argument('--model', default='', help='checkpoint to generate from (.pth)')
+    parser.add_argument('--generate_dir', default=os.environ.get('MORPHOGEN_GENDIR', './generated'),
+                        help='where generated SWCs + manifest.json go (env: MORPHOGEN_GENDIR)')
+    parser.add_argument('--dataroot', default=os.environ.get('MORPHOGEN_DATAROOT', ''),
+                        help='root holding <synset>/{train,val,test}/*.npy (env: MORPHOGEN_DATAROOT)')
     opt = parser.parse_args()
 
 

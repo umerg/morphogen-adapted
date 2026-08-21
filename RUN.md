@@ -11,7 +11,39 @@ actually breaks. Run both on the cluster.
 
 ---
 
-## 0. One-time setup
+## 0. Data paths
+
+Every path is a CLI flag with an environment-variable default, so you set them once per shell
+rather than repeating them. Nothing falls back to a hardcoded location: an unset or wrong
+`--dataroot` **exits immediately** with a message rather than yielding an empty dataset and a
+training loop that appears to run while doing nothing.
+
+```bash
+export MORPHOGEN_DATAROOT=/scratch/$USER/morphogen_npy   # <root>/<synset>/{train,val,test}/*.npy
+export MORPHOGEN_RUNS=/scratch/$USER/mg_runs             # checkpoints + logs
+export MORPHOGEN_GENDIR=/scratch/$USER/mg_gen            # generated SWCs + manifest.json
+export MORPHOGEN_CATEGORY=neurons                        # or class_0,...,class_6
+export DENDRITE_GEN=/scratch/$USER/dendrite_gen          # only needed by tools/recon_ref.py
+```
+
+| variable | flag | default if unset |
+|---|---|---|
+| `MORPHOGEN_DATAROOT` | `--dataroot` | *(empty -> exits with an error)* |
+| `MORPHOGEN_CATEGORY` | `--category` | `neurons` |
+| `MORPHOGEN_RUNS` | `--model_dir` | `./runs` |
+| `MORPHOGEN_GENDIR` | `--generate_dir` | `./generated` |
+| `DENDRITE_GEN` | — | `~/Documents/dendrite_gen` |
+
+An explicit flag always wins over the environment. The `tools/` scripts take their paths as
+required arguments (`--raw-root`, `--label-root`, `--out-root`, `--npy-root`) — only
+`DENDRITE_GEN` is environment-driven there.
+
+With these exported, the commands below shorten to e.g.
+`python DDPM_train.py --experiment_name uncond_parity --bs 256 --niter 300 --saveIter 10 --use_ema`.
+
+---
+
+## 1. One-time setup
 
 ```bash
 git clone <this repo> && cd MorphoGen
@@ -47,7 +79,7 @@ Expect `forward OK (2, 3, 2048) | params 32.8M`.
 
 ---
 
-## 1. Stage the data
+## 2. Stage the data
 
 Two corpora are needed. `neurons_raw` has the degree-2 (continuation) nodes MorphoGen requires;
 `neurons_conditional_full` supplies the `# cell_class` labels, joined by filename.
@@ -93,7 +125,7 @@ Expect 22773 / 2529 / 1167 and `(15000, 3) float32`.
 
 ---
 
-## 2. Dry run — GATE. Do not request real hours before this is green.
+## 3. Dry run — GATE. Do not request real hours before this is green.
 
 Exercises every interface on ~200 neurons. The point is interfaces, not numbers.
 
@@ -131,7 +163,7 @@ Checklist — all must pass:
 
 ---
 
-## 3. Main runs
+## 4. Main runs
 
 Two conditioning arms x two budgets. `--gamma_seed`/`--length_threshold` are **reconstruction**
 parameters and affect generation only, not training.
@@ -174,7 +206,7 @@ Generate from **EMA** weights. `morphology_gen.py` loads `model_state`, so patch
 
 ---
 
-## 4. Reconstruction parameters (calibrated on TRAIN, confirmed on held-out val)
+## 5. Reconstruction parameters (calibrated on TRAIN, confirmed on held-out val)
 
 | arm | flags |
 |---|---|
@@ -192,7 +224,7 @@ point clouds first (cheap, GPU), then reconstruct on CPU (~4 s/neuron, embarrass
 
 ---
 
-## 5. Known upstream bugs already fixed on this branch
+## 6. Known upstream bugs already fixed on this branch
 
 Kept here so cluster-side surprises are recognisable. Full rationale in the plan's deviations
 table; each is either a bug fix or a restoration of behaviour the paper describes.
