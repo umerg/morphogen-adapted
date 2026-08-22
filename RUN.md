@@ -107,7 +107,25 @@ rsync -a ~/Documents/neurons_raw/                <cluster>:/scratch/guptau/neuro
 rsync -a ~/Documents/neurons_conditional_full/   <cluster>:/scratch/guptau/neurons_conditional_full/
 ```
 
-Bake the point clouds (CPU, parallel, ~15 min for the full corpus at 16 workers):
+Bake the point clouds. **This is the slow step: ~6 s/neuron/worker**, dominated by the
+farthest-point-sample down to 15,000 points from the ~39k-point upsampled cloud.
+
+| cpus | wall-clock for 26,469 neurons |
+|---|---|
+| 16 | ~2.8 h |
+| 32 | ~1.4 h |
+| 64 | ~42 min |
+
+**Run it as a batch job** — `scripts/bake.sbatch` (CPU only, no GPU requested):
+
+```bash
+mkdir -p /itet-stor/$USER/net_scratch/cluster/jobs
+sbatch scripts/bake.sbatch
+tail -f /itet-stor/$USER/net_scratch/cluster/jobs/<jobid>.out
+```
+
+Progress prints every 50 neurons with rate and ETA, unbuffered (`python -u`), so `tail -f`
+shows it live. Or run it directly:
 
 ```bash
 # unconditional arm -- single synset "neurons"

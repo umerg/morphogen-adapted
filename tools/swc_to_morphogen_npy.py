@@ -40,6 +40,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -167,10 +168,13 @@ def main():
                          args.npoints, args.seed + i))
 
     print(f'baking {len(jobs)} neurons -> {args.out_root} '
-          f'(mode={args.mode}, npoints={args.npoints}, workers={args.workers})')
+          f'(mode={args.mode}, npoints={args.npoints}, workers={args.workers})', flush=True)
 
     failures = []
     done = 0
+    t0 = time.time()
+    # Progress must be flushed: without it stdout is block-buffered whenever this is
+    # piped or run under a batch scheduler, so a job that is working fine looks hung.
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
         futs = [ex.submit(process_one, j) for j in jobs]
         for fut in as_completed(futs):
@@ -178,8 +182,13 @@ def main():
             done += 1
             if err:
                 failures.append((src, err))
-            if done % 500 == 0 or done == len(jobs):
-                print(f'  {done}/{len(jobs)}  failures={len(failures)}')
+            if done % 50 == 0 or done == len(jobs):
+                el = time.time() - t0
+                rate = done / el
+                eta = (len(jobs) - done) / rate if rate else 0
+                print(f'  {done}/{len(jobs)}  {100*done/len(jobs):5.1f}%  '
+                      f'{rate:5.2f}/s  elapsed {el/60:5.1f}m  eta {eta/60:5.1f}m  '
+                      f'failures={len(failures)}', flush=True)
 
     print(f'\ndone: {done - len(failures)} written, {len(failures)} failed')
     for src, err in failures[:20]:
