@@ -45,6 +45,10 @@ With these exported, the commands below shorten to e.g.
 
 ## 1. One-time setup
 
+**Python must be >= 3.10.** A 3.8 env caps torch at 2.4.1 and numpy at 1.24 and cannot satisfy
+`requirements-baseline.txt`. The upstream README's `python==3.8.5` describes the authors' 2023
+environment, not this fork.
+
 ```bash
 git clone <this repo> && cd MorphoGen
 git checkout baseline-dendrite-gen
@@ -52,10 +56,24 @@ git checkout baseline-dendrite-gen
 conda create -n MORPHOGEN python=3.10 -y
 conda activate MORPHOGEN
 
-# CUDA build of torch -- pick the cu-version matching the cluster driver
+# 1. torch FIRST, matching the driver. Read the CUDA version from nvidia-smi.
+nvidia-smi | head -3
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install -r requirements-baseline.txt   # everything else (skip its torch/torchvision lines)
+
+# 2. everything else (this file does NOT pin torch, so it cannot clobber step 1)
+pip install -r requirements-baseline.txt
 ```
+
+**Order matters.** A cu121 build runs on any 12.x driver. `torch >= 2.6` dropped cu121 wheels, so
+on a 12.0-12.3 driver pin `torch==2.5.1` + `torchvision==0.20.1`. Installing torch from the
+default index instead gives a build compiled against a newer CUDA and fails at `.cuda()` with:
+
+```
+RuntimeError: The NVIDIA driver on your system is too old (found version 12020)
+```
+
+which means the *torch build* is too new for the driver, not that the driver needs updating.
+Check with `python -c "import torch; print(torch.__version__, torch.version.cuda)"`.
 
 The shipped `requirements.txt` is a raw `pip freeze` with ~15 unusable local
 `@ file:///croot/...` paths and cannot be installed — use `requirements-baseline.txt`.
