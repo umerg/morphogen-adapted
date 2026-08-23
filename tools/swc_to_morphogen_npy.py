@@ -124,6 +124,22 @@ def process_one(args):
         return (str(src), f'{type(exc).__name__}: {exc}')
 
 
+def is_complete(dst_npy: Path, npoints: int) -> bool:
+    """True if this neuron was already baked in full by an earlier run.
+
+    Checked by size rather than by loading: a truncated .npy from a killed job is
+    short, and the sidecar is written last, so requiring both is enough to make
+    a resumed run safe without paying a full np.load per file.
+    """
+    meta = dst_npy.with_suffix('.meta.json')
+    try:
+        if dst_npy.stat().st_size < npoints * 3 * 4:
+            return False
+        return 'scale_m' in json.loads(meta.read_text())
+    except (OSError, ValueError):
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -141,9 +157,11 @@ def main():
     ap.add_argument('--limit', type=int, default=0, help='only the first N per split (smoke test)')
     ap.add_argument('--workers', type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument('--seed', type=int, default=42, help='base seed; each neuron gets seed+index')
+    ap.add_argument('--skip-existing', action='store_true',
+                    help='resume a killed run: skip neurons already baked in full')
     args = ap.parse_args()
 
-    jobs = []
+    jobs, skipped = [], 0
     for split in args.splits:
         src_dir = args.raw_root / split
         if not src_dir.is_dir():
@@ -164,11 +182,18 @@ def main():
             else:
                 synset = args.synset
             dst = args.out_root / synset / split / (f.stem + '.npy')
+            if args.skip_existing and is_complete(dst, args.npoints):
+                skipped += 1
+                continue
             jobs.append((str(f), str(dst), str(label_src) if label_src else '',
                          args.npoints, args.seed + i))
 
     print(f'baking {len(jobs)} neurons -> {args.out_root} '
-          f'(mode={args.mode}, npoints={args.npoints}, workers={args.workers})', flush=True)
+          f'(mode={args.mode}, npoints={args.npoints}, workers={args.workers}'
+          f'{f", skipping {skipped} already done" if skipped else ""})', flush=True)
+    if not jobs:
+        print('nothing to do')
+        return
 
     failures = []
     done = 0
