@@ -856,23 +856,35 @@ def main():
 
 
 
+
+def _int_csv(s):
+    """Parse "0,3,6,9" into (0, 3, 6, 9).
+
+    Upstream declared this as type=tuple, which applies tuple() to the raw string
+    and yields a 7-element tuple of characters. Only reachable via --window_size > 0.
+    """
+    if isinstance(s, (tuple, list)):
+        return tuple(int(x) for x in s)
+    return tuple(int(x) for x in str(s).split(',') if x.strip())
+
+
 def parse_args():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--num_classes', type=int, default=1)
     parser.add_argument('--workers', type=int, default=16, help='workers')
-    parser.add_argument('--nc', default=3)
-    parser.add_argument('--npoints', default=2048)
+    parser.add_argument('--nc', type=int, default=3)
+    parser.add_argument('--npoints', type=int, default=2048)
     
     '''model'''
-    parser.add_argument('--beta_start', default=0.0001)
-    parser.add_argument('--beta_end', default=0.02)
+    parser.add_argument('--beta_start', type=float, default=0.0001)
+    parser.add_argument('--beta_end', type=float, default=0.02)
     parser.add_argument('--schedule_type', default='linear')
     parser.add_argument('--time_num', type=int, default=1000)
     parser.add_argument('--window_size', type=int, default=0)
-    parser.add_argument('--window_block_indexes', type=tuple, default='0,3,6,9')
+    parser.add_argument('--window_block_indexes', type=_int_csv, default=(0, 3, 6, 9))
     parser.add_argument('--attention', default=True)
-    parser.add_argument('--dropout', default=0.1)
+    parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--embed_dim', type=int, default=64)
     parser.add_argument('--loss_type', default='mse')
     parser.add_argument('--model_mean_type', default='eps')
@@ -910,8 +922,8 @@ def parse_args():
     parser.add_argument('--model_type', default='DiT-S/4')
     parser.add_argument('--niter', type=int, default=40000, help='number of epochs to train for')
     parser.add_argument('--bs', type=int, default=400)  # BUGFIX: was untyped, so CLI overrides arrived as str
-    parser.add_argument('--voxel_size', default=32)
-    parser.add_argument('--lr', default=1e-4)
+    parser.add_argument('--voxel_size', type=int, choices=[16, 32, 64], default=32)
+    parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--use_tb', action='store_true', default=True, help = 'use tensorboard')
     parser.add_argument('--model', default='', help="path to model (to continue training)")
 # Data paths default from the environment so a forgotten flag fails loudly instead of

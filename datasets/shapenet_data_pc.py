@@ -60,19 +60,30 @@ class Uniform15KPC(Dataset):
                 all_mids.append(os.path.join(self.split, x[:-len('.npy')]))
 
             # NOTE: [mid] contains the split: i.e. "train/<mid>" or "val/<mid>" or "test/<mid>"
+            n_unreadable = 0
             for mid in all_mids:
                 # obj_fname = os.path.join(sub_path, x)
                 obj_fname = os.path.join(root_dir, subd, mid + ".npy")
                 try:
                     point_cloud = np.load(obj_fname)  # (15k, 3)
-
-                except:
+                except Exception as exc:
+                    # Upstream swallowed this with a bare `except: continue`, so a
+                    # truncated or unreadable file silently shrank the training set
+                    # with nothing in the logs to show it.
+                    n_unreadable += 1
+                    if n_unreadable <= 5:
+                        print(f'  WARNING: unreadable, skipping: {obj_fname} '
+                              f'({type(exc).__name__}: {exc})')
                     continue
 
                 assert point_cloud.shape[0] == 15000
                 self.all_points.append(point_cloud[np.newaxis, ...])
                 self.cate_idx_lst.append(cate_idx)
                 self.all_cate_mids.append((subd, mid))
+
+            if n_unreadable:
+                print(f'  WARNING: {n_unreadable}/{len(all_mids)} .npy files in '
+                      f'{subd}/{self.split} were unreadable and were dropped')
 
         # Shuffle the index deterministically (based on the number of examples)
         self.shuffle_idx = list(range(len(self.all_points)))
