@@ -5,9 +5,13 @@
 #SBATCH --mem=32G
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=32
+<<<<<<< HEAD
 #SBATCH --time=12:00:00
 #SBATCH --signal=B:TERM@600
 #SBATCH --exclude=tikgpu10
+=======
+#SBATCH --nodelist=arton10 # Specify that it should run on this particular node
+>>>>>>> 4d2c8bf (bake batch job changes)
 #
 # Bake SWC -> (15000,3) point clouds.  CPU ONLY -- no --gres=gpu here on purpose.
 #
@@ -30,7 +34,7 @@ ETH_USERNAME=guptau
 PROJECT_NAME=morphogen-adapted
 DIRECTORY=/itet-stor/${ETH_USERNAME}/net_scratch/${PROJECT_NAME}
 CONDA_ENVIRONMENT=MOPRHO2
-SCRATCH=/itet-stor/${ETH_USERNAME}/net_scratch
+SCRATCH=/scratch/${ETH_USERNAME}
 
 RAW_SRC=${SCRATCH}/neurons_raw
 LABEL_SRC=${SCRATCH}/neurons_conditional_full
