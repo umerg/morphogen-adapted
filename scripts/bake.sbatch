@@ -30,7 +30,7 @@ ETH_USERNAME=guptau
 PROJECT_NAME=morphogen-adapted
 DIRECTORY=/itet-stor/${ETH_USERNAME}/net_scratch/${PROJECT_NAME}
 CONDA_ENVIRONMENT=MOPRHO2
-SCRATCH=/itet-stor/${ETH_USERNAME}/net_scratch
+SCRATCH=/scratch/${ETH_USERNAME}
 
 RAW_SRC=${SCRATCH}/neurons_raw
 LABEL_SRC=${SCRATCH}/neurons_conditional_full
