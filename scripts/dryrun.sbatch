@@ -4,10 +4,13 @@
 #SBATCH --error=/itet-stor/guptau/net_scratch/cluster/jobs/%j.err
 #SBATCH --mem=32G
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1
-#SBATCH --time=02:00:00
 #SBATCH --exclude=tikgpu10
+#SBATCH --nodelist=tikgpu07 # Specify that it should run on this particular node
+#CommentSBATCH --account=tik-internal
+#CommentSBATCH --constraint='titan_rtx|tesla_v100|titan_xp|a100_80gb'
+
 #
 # Stage-4 GATE: exercises every interface on a small subset. The point is
 # interfaces, not numbers -- do not request full-run hours until this is green.
@@ -22,7 +25,7 @@ ETH_USERNAME=guptau
 PROJECT_NAME=morphogen-adapted
 DIRECTORY=/itet-stor/${ETH_USERNAME}/net_scratch/${PROJECT_NAME}
 CONDA_ENVIRONMENT=MOPRHO2
-SCRATCH=/itet-stor/${ETH_USERNAME}/net_scratch
+SCRATCH=/scratch/${ETH_USERNAME}
 
 set -o errexit
 

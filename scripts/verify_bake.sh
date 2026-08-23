@@ -1,8 +1,8 @@
 #!/bin/bash
 # Where did the baked point clouds actually go?  Run on the login node.
 #   bash scripts/verify_bake.sh [out_root]
-OUT=${1:-/itet-stor/guptau/net_scratch/morphogen_npy}
-SCRATCH=/itet-stor/guptau/net_scratch
+OUT=${1:-/scratch/guptau/morphogen_npy}
+SCRATCH=/scratch/guptau
 
 echo "=== 1. counts at the expected destination: ${OUT} ==="
 for s in train val test; do
