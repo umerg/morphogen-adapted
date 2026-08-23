@@ -36,9 +36,9 @@ CONDA_ENVIRONMENT=MOPRHO2
 # Pointing these at /scratch/$USER makes it stage local -> local and "copy back"
 # to local, which is how the first 10 h bake ended up stranded on arton10.
 SHARE=/itet-stor/${ETH_USERNAME}/net_scratch
-RAW_SRC=${SHARE}/neurons_raw
-LABEL_SRC=${SHARE}/neurons_conditional_full
-OUT_DST=${SHARE}/morphogen_npy
+RAW_SRC=${RAW_SRC:-${SHARE}/neurons_raw}
+LABEL_SRC=${LABEL_SRC:-${SHARE}/neurons_conditional_full}
+OUT_DST=${OUT_DST:-${SHARE}/morphogen_npy}
 
 set -o errexit
 set -o pipefail
@@ -97,6 +97,11 @@ echo "Conda activated: $(python --version 2>&1)"
 cd ${DIRECTORY}
 
 # ---- stage the corpus in -----------------------------------------------------
+case ${OUT_DST} in
+  /scratch/*) echo "WARNING: OUT_DST=${OUT_DST} is node-local and will not survive the node." >&2
+              echo "WARNING: copy it to ${SHARE} before the allocation ends." >&2 ;;
+esac
+
 if [[ ! -d ${RAW_SRC} ]]; then
   echo "FATAL: raw corpus not found at ${RAW_SRC}" >&2; exit 1
 fi
