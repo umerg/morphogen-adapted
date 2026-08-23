@@ -30,11 +30,15 @@ ETH_USERNAME=guptau
 PROJECT_NAME=morphogen-adapted
 DIRECTORY=/itet-stor/${ETH_USERNAME}/net_scratch/${PROJECT_NAME}
 CONDA_ENVIRONMENT=MOPRHO2
-SCRATCH=/scratch/${ETH_USERNAME}
 
-RAW_SRC=${SCRATCH}/neurons_raw
-LABEL_SRC=${SCRATCH}/neurons_conditional_full
-OUT_DST=${SCRATCH}/morphogen_npy
+# These are the SHARE paths, not node-local ones. The script stages the corpus
+# onto node-local disk itself (see LOCAL below) and copies the result back here.
+# Pointing these at /scratch/$USER makes it stage local -> local and "copy back"
+# to local, which is how the first 10 h bake ended up stranded on arton10.
+SHARE=/itet-stor/${ETH_USERNAME}/net_scratch
+RAW_SRC=${SHARE}/neurons_raw
+LABEL_SRC=${SHARE}/neurons_conditional_full
+OUT_DST=${SHARE}/morphogen_npy
 
 set -o errexit
 set -o pipefail
@@ -93,6 +97,16 @@ echo "Conda activated: $(python --version 2>&1)"
 cd ${DIRECTORY}
 
 # ---- stage the corpus in -----------------------------------------------------
+if [[ ! -d ${RAW_SRC} ]]; then
+  echo "FATAL: raw corpus not found at ${RAW_SRC}" >&2; exit 1
+fi
+if [[ ! -d ${LABEL_SRC} ]]; then
+  # Not fatal for the unconditional arm, but every sidecar would get
+  # cell_class=null, and --mode class would then skip all 26,469 neurons.
+  echo "WARNING: label corpus not found at ${LABEL_SRC}" >&2
+  echo "WARNING: sidecars will have cell_class=null; the class-conditional arm needs this" >&2
+fi
+
 echo "=== staging corpus to node-local disk ==="
 t0=$(date +%s)
 rsync -a "${RAW_SRC}/"   "${LOCAL}/in_raw/"
