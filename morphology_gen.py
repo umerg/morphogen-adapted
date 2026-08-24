@@ -940,8 +940,34 @@ def test(gpu, opt, output_dir):
         if should_diag:
             logger.info("Resume Path:%s" % opt.model)
 
-        resumed_param = torch.load(opt.model)
-        model.load_state_dict(resumed_param['model_state'])
+        resumed_param = torch.load(opt.model, map_location='cpu')
+
+        # Generate from the EMA weights whenever the checkpoint carries them.
+        # The shipped code always took 'model_state' (the raw weights), so a run
+        # that trained with --use_ema and selected a checkpoint on EMA would
+        # then have generated from something else entirely, with nothing in the
+        # output to reveal it.
+        #
+        # Key prefixes differ: the EMA copy is deepcopy'd before
+        # multi_gpu_wrapper runs, so it is stored unwrapped ('model.*') while
+        # 'model_state' and the live model here are wrapped ('model.module.*').
+        # Remap to whatever this model actually asks for.
+        source = 'ema' if 'ema' in resumed_param else 'model_state'
+        state = resumed_param[source]
+
+        wants_module = any(k.startswith('model.module.')
+                           for k in model.state_dict())
+
+        def _remap(k):
+            if wants_module and k.startswith('model.') and not k.startswith('model.module.'):
+                return 'model.module.' + k[len('model.'):]
+            if not wants_module and k.startswith('model.module.'):
+                return 'model.' + k[len('model.module.'):]
+            return k
+
+        if should_diag:
+            logger.info('Loading weights from %s[%s]' % (opt.model, source))
+        model.load_state_dict({_remap(k): v for k, v in state.items()})
 
         opt.eval_path = os.path.join(outf_syn, 'samples.pth')
         Path(opt.eval_path).parent.mkdir(parents=True, exist_ok=True)

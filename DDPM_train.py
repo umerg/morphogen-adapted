@@ -812,7 +812,12 @@ def train(gpu, opt, output_dir, noises_init, train_dataset=None):
                     torch.load('%s/epoch_%d.pth' % (output_dir, epoch), map_location=map_location)['model_state'])
                 
 
-    dist.destroy_process_group()
+    # Only 'multi' ever calls init_process_group, so tearing one down
+    # unconditionally raised an AssertionError on the way out of every
+    # single-GPU run -- after training had already finished and the
+    # checkpoints were on disk, which made a green run look like a failure.
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def _require_dataroot(opt):
