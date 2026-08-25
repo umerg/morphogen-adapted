@@ -100,6 +100,9 @@ fi
 echo "using: train $(ls ${DATA}/neurons/train/*.npy | wc -l), val $(ls ${DATA}/neurons/val/*.npy | wc -l)"
 
 # --- train -------------------------------------------------------------------
+# --workers defaults to 16, which oversubscribes a --cpus-per-task=4 allocation
+# and makes torch warn; track the allocation instead.
+#
 # --bs MUST be <= the number of training neurons: the loader uses drop_last=True,
 # so a batch larger than the dataset yields ZERO batches and the loop silently
 # completes having done nothing.
@@ -107,6 +110,7 @@ python -u DDPM_train.py \
   --dataroot "${DATA}" --category neurons \
   --model_dir "${RUNS}" --experiment_name dryrun \
   --bs 64 --niter 20 --saveIter 5 --use_ema \
+  --workers ${SLURM_CPUS_PER_TASK:-4} \
   --npoints 2048 --model_type DiT-S/4 --voxel_size 32 --num_classes 1
 
 echo "=== checkpoints ==="
@@ -127,7 +131,7 @@ python -u morphology_gen.py \
   --dataroot "${DATA}" --category neurons \
   --model "${RUNS}/dryrun/epoch_19.pth" \
   --generate_dir "${GEN}" \
-  --bs 16 --num_classes 1 \
+  --bs 16 --num_classes 1 --workers ${SLURM_CPUS_PER_TASK:-4} \
   --detect_radius 0.30 --root_cap 23 --gamma_seed 0.40 --length_threshold 0.30
 
 echo "=== generated output ==="
