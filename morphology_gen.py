@@ -837,9 +837,10 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
                     'sid': str(sids[j] if isinstance(sids, (list, tuple)) else sids[j]),
                     'cate_idx': int(y[j]),
                     'gen_index': a,
-                    # Pre-normalisation radius. A model that has learned the
-                    # unit-sphere training distribution emits ~1.0; a large
-                    # deviation is a training-health signal, not a scale to use.
+                    # Max radial norm of the generated cloud. Training was
+                    # unit-sphere, so a model that has learned the distribution
+                    # emits ~1.0; a deviation is a training-health signal, not
+                    # a scale to correct for.
                     'gen_radius': float(gen_radius),
                     'mean': [float(v) for v in m[j].flatten()],
                     'std': float(s[j].flatten()[0]),
