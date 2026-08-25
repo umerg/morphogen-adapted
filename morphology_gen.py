@@ -27,6 +27,7 @@ from sklearn.decomposition import PCA
 from utils.cut import filter_short_branches
 from utils.utils import load_neuron
 from utils.swc_denoise import auxi
+from sub_process import pc_normlize
 '''
 models
 '''
@@ -774,6 +775,30 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
             x = x * s + m
             for j, pc in enumerate(gen): #torch.Size([2048, 3])
                 points = pc.numpy()
+
+                # Reconstruct in the space every reconstruction constant was
+                # calibrated in. GT clouds are unit-sphere by construction --
+                # pc_normlize divides by the max radial norm, so max||p|| == 1
+                # and per-axis ptp <= 2 -- and detect_radius / length_threshold
+                # are therefore unit-sphere quantities (see tools/recon_ref.py,
+                # which is where they were fitted).
+                #
+                # Nothing forces a *generated* cloud to satisfy that invariant.
+                # The DDPM only approximately learned it, and with
+                # clip_denoised=False a half-trained reverse chain drifts far
+                # out of range: a 20-epoch dry run produced clouds of extent
+                # ~355, at which detect_radius=0.30 puts every point alone in
+                # its own ball, all densities tie at 1, and the soma is chosen
+                # arbitrarily -- the mirror image of the shipped r=5.0 failure.
+                #
+                # Renormalising discards nothing: training had zero scale
+                # variance (every neuron was baked to radius exactly 1), so the
+                # sample's own radius carries no information, and absolute scale
+                # is restored post-hoc from the manifest. What it does is keep
+                # the reconstruction in-domain regardless of model health.
+                points, _, gen_radius = pc_normlize(points.astype(np.float64))
+                points = points.astype(np.float32)
+
                 point_swc_L1 = L1_medial(points=points, NCenters=2048,iters=1)
                 # Seed fps per-sample so the reconstruction is reproducible.
                 ske = point_swc_L1[fps(point_swc_L1, 1200, seed=opt.manualSeed + a), :] #(1200,3)
@@ -814,6 +839,10 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
                     'sid': str(sids[j] if isinstance(sids, (list, tuple)) else sids[j]),
                     'cate_idx': int(y[j]),
                     'gen_index': a,
+                    # Pre-normalisation radius. A model that has learned the
+                    # unit-sphere training distribution emits ~1.0; a large
+                    # deviation is a training-health signal, not a scale to use.
+                    'gen_radius': float(gen_radius),
                     'mean': [float(v) for v in m[j].flatten()],
                     'std': float(s[j].flatten()[0]),
                 })
@@ -827,6 +856,24 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
     with open(os.path.join(opt.generate_dir, 'manifest.json'), 'w') as f:
         json.dump(manifest, f, indent=1)
     print(f"wrote {len(manifest)} neurons + manifest.json to {opt.generate_dir}")
+
+    # Training normalised every neuron to radius exactly 1, so a model that has
+    # learned the distribution emits ~1.0 here. Report it: it is the cheapest
+    # available read on whether the samples are in-distribution at all, and it
+    # is otherwise invisible now that reconstruction renormalises.
+    if manifest:
+        radii = np.array([r['gen_radius'] for r in manifest])
+        print('generated radius (training distribution is exactly 1.0): '
+              'median {:.3g}  p10 {:.3g}  p90 {:.3g}'.format(
+                  float(np.median(radii)), float(np.percentile(radii, 10)),
+                  float(np.percentile(radii, 90))))
+        if not 0.5 < float(np.median(radii)) < 2.0:
+            warnings.warn(
+                'generated clouds have median radius {:.3g} against a training '
+                'distribution of exactly 1.0 -- the samples are far out of '
+                'distribution. Reconstruction renormalises so it will still run, '
+                'but the morphometrics are not meaningful yet.'.format(
+                    float(np.median(radii))), RuntimeWarning)
     # BUGFIX: upstream returned `output_dir`, which is not defined in this scope --
     # a NameError raised AFTER the entire (very expensive) generation loop, discarding
     # the run. `outf_syn` is the directory this function actually writes under.
