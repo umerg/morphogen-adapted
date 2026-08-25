@@ -731,6 +731,30 @@ def generate_a_tree(neuron,model, args, radius=0.2, type_=1):
 
     return nodes
 
+def load_sidecars(dataroot, cate_mids):
+    """(sid, mid) -> (scale_m, centroid) from the bake sidecars.
+
+    Raises SystemExit listing what is missing, rather than returning a partial
+    map: generation is hours of GPU plus reconstruction, and a scale we cannot
+    restore makes the whole run unusable downstream.
+    """
+    out, missing = {}, []
+    for sid, mid in cate_mids:
+        # not Path.with_suffix: it would eat the last dot-segment of a dotted id
+        path = os.path.join(dataroot, sid, mid + '.meta.json')
+        try:
+            meta = json.loads(open(path).read())
+            out[(sid, mid)] = (float(meta['scale_m']), [float(v) for v in meta['centroid']])
+        except (OSError, ValueError, KeyError, TypeError):
+            missing.append(path)
+    if missing:
+        raise SystemExit(
+            'cannot restore scale: {} of {} sidecars are missing or lack '
+            'scale_m/centroid, e.g.\n  {}'.format(
+                len(missing), len(cate_mids), '\n  '.join(missing[:5])))
+    return out
+
+
 def generate_eval(model, opt, gpu, outf_syn, evaluator):
 
     _, test_dataset = get_dataset(opt.dataroot, opt.npoints, opt.category)
@@ -755,6 +779,20 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
     # counter silently pairs every neuron with an arbitrary other one. Name each output
     # by its source `mid` and emit a manifest so the join is explicit.
     manifest = []
+
+    # Per-neuron scale, for the adapter to restore with. pc_normlize divided each
+    # baked neuron by its own max radial norm and the .npy kept only the points, so
+    # `scale_m` and `centroid` live in the bake sidecars. Join them by NAME here --
+    # `sid`/`mid` come straight off the batch and the sidecar is exactly
+    # <dataroot>/<sid>/<mid>.meta.json -- rather than by carrying a side array through
+    # the dataset, whose three index spaces (pre-shuffle entries, shuffle order,
+    # post-skip n_written) make an index-keyed array silently misalign. That is the
+    # very failure this manifest exists to prevent.
+    #
+    # Preloaded up front, so a missing sidecar fails in the first second instead of
+    # after hours of sampling and reconstruction.
+    sidecars = load_sidecars(opt.dataroot, test_dataset.all_cate_mids)
+    print(f'loaded {len(sidecars)} bake sidecars for scale restoration')
 
     with torch.no_grad():
 
@@ -831,12 +869,20 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
                 stem = str(mid).replace('/', '__')
                 fname = f"{stem}.swc"
                 file_path = os.path.join(opt.generate_dir, fname)
+                sid = str(sids[j] if isinstance(sids, (list, tuple)) else sids[j])
+                gt_scale_m, gt_centroid = sidecars[(sid, str(mid))]
                 manifest.append({
                     'file': fname,
                     'mid': str(mid),
-                    'sid': str(sids[j] if isinstance(sids, (list, tuple)) else sids[j]),
+                    'sid': sid,
                     'cate_idx': int(y[j]),
                     'gen_index': a,
+                    # The PAIRED GT neuron's normalisation constants, i.e. S-oracle
+                    # input. Named gt_* so using them for the distributional table --
+                    # which plan section 5 forbids, since it scores the baseline on a
+                    # quantity we handed it -- is visible at the call site.
+                    'gt_scale_m': gt_scale_m,
+                    'gt_centroid': gt_centroid,
                     # Max radial norm of the generated cloud. Training was
                     # unit-sphere, so a model that has learned the distribution
                     # emits ~1.0; a deviation is a training-health signal, not
@@ -852,8 +898,14 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
                         f.write(node_str + "\n")
 
     # Explicit generated -> source join for the evaluation harness.
+    # Envelope, not a bare list: the SWCs on disk are in UNIT-SPHERE coordinates
+    # (reconstruction runs there, and scale is restored downstream), so say so
+    # explicitly and give the adapter something to assert on rather than infer.
     with open(os.path.join(opt.generate_dir, 'manifest.json'), 'w') as f:
-        json.dump(manifest, f, indent=1)
+        json.dump({'version': 2,
+                   'space': 'unit_sphere',
+                   'scale_restored': False,
+                   'neurons': manifest}, f, indent=1)
     print(f"wrote {len(manifest)} neurons + manifest.json to {opt.generate_dir}")
 
     # Training normalised every neuron to radius exactly 1, so a model that has

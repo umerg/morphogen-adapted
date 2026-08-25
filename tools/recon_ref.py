@@ -64,53 +64,11 @@ from validation.structural_metrics import (  # noqa: E402
     branch_order_values, mean_branch_length, partition_asymmetry, strahler_number,
 )
 
-SWC_COLS = ['id', 'type', 'x', 'y', 'z', 'radius', 'parent']
-CLEAN_KW = dict(root_parent_value=0, keep_parent_value=0,
-                max_depth=None, keep_attrs=True, root_mode='index')
-
-
-def to_one_indexed(df):
-    """Shift a 0-indexed SWC to the 1-indexed convention dendrite_gen expects.
-
-    CRITICAL: the raw MICrONS corpus is 0-indexed -- the soma is id 0 with parent -1,
-    so its children carry parent == 0. But clean_swc_tree treats `parent <= root_parent_value`
-    (=0) as "this node IS a root". Fed 0-indexed input it therefore promotes every primary
-    dendrite to its own root and returns a FOREST, silently shattering each neuron into
-    ~7 disconnected components rather than raising. Shift ids by +1 so parent==0 again
-    means "root" and nothing else.
-    """
-    if len(df) == 0 or int(df['id'].min()) != 0:
-        return df
-    out = df.copy()
-    out['id'] = out['id'].astype(int) + 1
-    out['parent'] = np.where(df['parent'].astype(int) < 0, 0, df['parent'].astype(int) + 1)
-    return out
-
-
-def df_to_graph(df):
-    """clean_swc_tree output -> rooted nx tree, matching utils.data_loading.load_swc_graph."""
-    import networkx as nx
-    G = nx.Graph()
-    pos = {}
-    root = None
-    for r in df.itertuples(index=False):
-        G.add_node(int(r.id))
-        pos[int(r.id)] = np.array([r.x, r.y, r.z], float)
-        if int(r.parent) <= 0:
-            root = int(r.id)
-    for r in df.itertuples(index=False):
-        if int(r.parent) > 0:
-            G.add_edge(int(r.parent), int(r.id))
-    if root is None:
-        raise ValueError('no root: no node has parent <= 0')
-    if nx.number_connected_components(G) != 1:
-        raise ValueError(f'expected a tree, got {nx.number_connected_components(G)} components '
-                         '(0-indexed input fed to a 1-indexed consumer?)')
-    origin = pos[root]
-    for n in G.nodes:
-        G.nodes[n]['pos'] = pos[n] - origin
-    G.graph['root'] = root
-    return G
+# Shared with the generation path and the dendrite_gen adapter, so the scale
+# restore cannot drift out of position. See tools/morphogen_swc.py.
+from tools.morphogen_swc import (  # noqa: E402
+    CLEAN_KW, SWC_COLS, df_to_graph, restore_scale_and_clean, to_one_indexed,
+)
 
 
 def summarise(G):
@@ -150,12 +108,12 @@ def reconstruct(cloud15k, meta, aux_model, args, rng, n_root_children=None, seed
     nodes = auxi(pd.DataFrame(cut), aux_model)
     t['aux'] = time.time() - t0
 
-    df = pd.DataFrame(nodes, columns=SWC_COLS)
-    # Restore the per-neuron scale pc_normlize removed (last step, after reconstruction:
-    # detect_radius and length_threshold both live in normalized units).
-    df[['x', 'y', 'z']] = df[['x', 'y', 'z']] * meta['scale_m'] + np.asarray(meta['centroid'])
-
-    t0 = time.time(); clean = clean_swc_tree(df, **CLEAN_KW); t['clean'] = time.time() - t0
+    # Restore the per-neuron scale pc_normlize removed, then clean. Bundled so
+    # the restore cannot be moved ahead of filter_short_branches/auxi, which are
+    # calibrated in unit-sphere units.
+    t0 = time.time()
+    clean = restore_scale_and_clean(nodes, meta['scale_m'], meta['centroid'])
+    t['clean'] = time.time() - t0
     return df_to_graph(clean), t
 
 
