@@ -27,7 +27,6 @@ from sklearn.decomposition import PCA
 from utils.cut import filter_short_branches
 from utils.utils import load_neuron
 from utils.swc_denoise import auxi
-from sub_process import pc_normlize
 '''
 models
 '''
@@ -776,28 +775,27 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
             for j, pc in enumerate(gen): #torch.Size([2048, 3])
                 points = pc.numpy()
 
-                # Reconstruct in the space every reconstruction constant was
-                # calibrated in. GT clouds are unit-sphere by construction --
-                # pc_normlize divides by the max radial norm, so max||p|| == 1
-                # and per-axis ptp <= 2 -- and detect_radius / length_threshold
-                # are therefore unit-sphere quantities (see tools/recon_ref.py,
-                # which is where they were fitted).
+                # The scale chain is already consistent, so do NOT rescale here.
+                # The .npy corpus is unit-sphere by construction (pc_normlize
+                # divides by the max radial norm, so max||p|| == 1 exactly), the
+                # dataset standardises by a global (m, s), and the `gen * s + m`
+                # above is that exact inverse -- which lands back in unit-sphere
+                # space, the space detect_radius and length_threshold were
+                # calibrated in (tools/recon_ref.py:154).
                 #
-                # Nothing forces a *generated* cloud to satisfy that invariant.
-                # The DDPM only approximately learned it, and with
-                # clip_denoised=False a half-trained reverse chain drifts far
-                # out of range: a 20-epoch dry run produced clouds of extent
-                # ~355, at which detect_radius=0.30 puts every point alone in
-                # its own ball, all densities tie at 1, and the soma is chosen
-                # arbitrarily -- the mirror image of the shipped r=5.0 failure.
+                # Note s is ~0.23 on this corpus, so that multiply SHRINKS by
+                # ~4.3x; it cannot inflate. Reconstructing before it would be
+                # the actual bug: standardised space is 1/s larger than the
+                # space the constants belong to.
                 #
-                # Renormalising discards nothing: training had zero scale
-                # variance (every neuron was baked to radius exactly 1), so the
-                # sample's own radius carries no information, and absolute scale
-                # is restored post-hoc from the manifest. What it does is keep
-                # the reconstruction in-domain regardless of model health.
-                points, _, gen_radius = pc_normlize(points.astype(np.float64))
-                points = points.astype(np.float32)
+                # So a generated cloud that is not ~radius 1 is a model that has
+                # not learned the training distribution -- training had zero
+                # scale variance, every neuron baked to radius exactly 1. Record
+                # that as a diagnostic and leave the points alone. Renormalising
+                # here would hide a model failure and hand the baseline a repair
+                # it did not earn.
+                gen_radius = float(np.sqrt(
+                    ((points - points.mean(axis=0)) ** 2).sum(axis=1)).max())
 
                 point_swc_L1 = L1_medial(points=points, NCenters=2048,iters=1)
                 # Seed fps per-sample so the reconstruction is reproducible.
@@ -871,8 +869,9 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
             warnings.warn(
                 'generated clouds have median radius {:.3g} against a training '
                 'distribution of exactly 1.0 -- the samples are far out of '
-                'distribution. Reconstruction renormalises so it will still run, '
-                'but the morphometrics are not meaningful yet.'.format(
+                'distribution, so detect_radius and length_threshold are being '
+                'applied at the wrong scale and the morphometrics are not '
+                'meaningful. Train longer; do not rescale here.'.format(
                     float(np.median(radii))), RuntimeWarning)
     # BUGFIX: upstream returned `output_dir`, which is not defined in this scope --
     # a NameError raised AFTER the entire (very expensive) generation loop, discarding
