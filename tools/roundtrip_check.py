@@ -33,8 +33,11 @@ import numpy as np
 
 # dendrite_gen supplies the metric implementations; override for other checkouts.
 DENDRITE_GEN = Path(os.environ.get('DENDRITE_GEN', Path.home() / 'Documents' / 'dendrite_gen'))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(DENDRITE_GEN))
 from validation.geometric_metric import bbox_diag_length, height_z_range  # noqa: E402
+
+from tools.morphogen_swc import restore_scale  # noqa: E402
 
 UHAT = (0.0, 1.0, 0.0)          # config/neuron_type_conditional_run.yaml: so2_axis
 
@@ -109,7 +112,7 @@ def main():
         identity_err = float(np.abs(back - cloud).max())
 
         # restore the per-neuron scale discarded by pc_normlize
-        restored = back * meta['scale_m'] + np.asarray(meta['centroid'])
+        restored = restore_scale(back, meta['scale_m'], meta['centroid'])
 
         s_raw, s_new = stats(raw_pts), stats(restored)
         row = {'file': p.stem, 'identity_err': identity_err,

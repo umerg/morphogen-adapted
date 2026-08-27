@@ -142,13 +142,27 @@ swc = glob.glob(os.path.join(d, '*.swc'))
 man = os.path.join(d, 'manifest.json')
 print('swc files:', len(swc), '| manifest:', os.path.isfile(man))
 if os.path.isfile(man):
-    m = json.load(open(man))
+    doc = json.load(open(man))
+    print('manifest v%s | space=%s | scale_restored=%s'
+          % (doc.get('version'), doc.get('space'), doc.get('scale_restored')))
+    # The SWCs are written in unit-sphere coordinates; the adapter restores scale
+    # from gt_scale_m/gt_centroid. If this ever flips, the adapter must know.
+    if doc.get('space') != 'unit_sphere' or doc.get('scale_restored') is not False:
+        raise SystemExit('GATE FAILED: manifest does not declare unrestored unit-sphere output')
+    m = doc['neurons']
     mids = [r['mid'] for r in m]
     print('manifest rows:', len(m), '| unique mids:', len(set(mids)),
           '| bijection:', len(m) == len(set(mids)) == len(swc))
-    print('sample:', {k: m[0][k] for k in ('file', 'mid', 'cate_idx')})
+    print('sample:', {k: m[0][k] for k in ('file', 'mid', 'cate_idx', 'gt_scale_m')})
     if not (len(m) == len(set(mids)) == len(swc)):
         raise SystemExit('GATE FAILED: manifest is not a bijection onto the generated SWCs')
+    if any(r.get('gt_scale_m') is None for r in m):
+        raise SystemExit('GATE FAILED: manifest rows are missing gt_scale_m')
+    # A bijection alone would not catch a systematic mid<->scale swap; the restored
+    # radius should land in the right ballpark for a real cortical dendrite.
+    rad = [r['gen_radius'] * r['gt_scale_m'] for r in m]
+    print('restored radius um: min %.1f  median %.1f  max %.1f'
+          % (min(rad), sorted(rad)[len(rad) // 2], max(rad)))
 elif not swc:
     raise SystemExit('GATE FAILED: no SWC files were generated')
 PY

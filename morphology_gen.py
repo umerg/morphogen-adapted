@@ -731,6 +731,30 @@ def generate_a_tree(neuron,model, args, radius=0.2, type_=1):
 
     return nodes
 
+def load_sidecars(dataroot, cate_mids):
+    """(sid, mid) -> (scale_m, centroid) from the bake sidecars.
+
+    Raises SystemExit listing what is missing, rather than returning a partial
+    map: generation is hours of GPU plus reconstruction, and a scale we cannot
+    restore makes the whole run unusable downstream.
+    """
+    out, missing = {}, []
+    for sid, mid in cate_mids:
+        # not Path.with_suffix: it would eat the last dot-segment of a dotted id
+        path = os.path.join(dataroot, sid, mid + '.meta.json')
+        try:
+            meta = json.loads(open(path).read())
+            out[(sid, mid)] = (float(meta['scale_m']), [float(v) for v in meta['centroid']])
+        except (OSError, ValueError, KeyError, TypeError):
+            missing.append(path)
+    if missing:
+        raise SystemExit(
+            'cannot restore scale: {} of {} sidecars are missing or lack '
+            'scale_m/centroid, e.g.\n  {}'.format(
+                len(missing), len(cate_mids), '\n  '.join(missing[:5])))
+    return out
+
+
 def generate_eval(model, opt, gpu, outf_syn, evaluator):
 
     _, test_dataset = get_dataset(opt.dataroot, opt.npoints, opt.category)
@@ -756,6 +780,20 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
     # by its source `mid` and emit a manifest so the join is explicit.
     manifest = []
 
+    # Per-neuron scale, for the adapter to restore with. pc_normlize divided each
+    # baked neuron by its own max radial norm and the .npy kept only the points, so
+    # `scale_m` and `centroid` live in the bake sidecars. Join them by NAME here --
+    # `sid`/`mid` come straight off the batch and the sidecar is exactly
+    # <dataroot>/<sid>/<mid>.meta.json -- rather than by carrying a side array through
+    # the dataset, whose three index spaces (pre-shuffle entries, shuffle order,
+    # post-skip n_written) make an index-keyed array silently misalign. That is the
+    # very failure this manifest exists to prevent.
+    #
+    # Preloaded up front, so a missing sidecar fails in the first second instead of
+    # after hours of sampling and reconstruction.
+    sidecars = load_sidecars(opt.dataroot, test_dataset.all_cate_mids)
+    print(f'loaded {len(sidecars)} bake sidecars for scale restoration')
+
     with torch.no_grad():
 
         samples = []
@@ -774,6 +812,29 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
             x = x * s + m
             for j, pc in enumerate(gen): #torch.Size([2048, 3])
                 points = pc.numpy()
+
+                # The scale chain is already consistent, so do NOT rescale here.
+                # The .npy corpus is unit-sphere by construction (pc_normlize
+                # divides by the max radial norm, so max||p|| == 1 exactly), the
+                # dataset standardises by a global (m, s), and the `gen * s + m`
+                # above is that exact inverse -- which lands back in unit-sphere
+                # space, the space detect_radius and length_threshold were
+                # calibrated in (tools/recon_ref.py:154).
+                #
+                # Note s is ~0.23 on this corpus, so that multiply SHRINKS by
+                # ~4.3x; it cannot inflate. Reconstructing before it would be
+                # the actual bug: standardised space is 1/s larger than the
+                # space the constants belong to.
+                #
+                # So a generated cloud that is not ~radius 1 is a model that has
+                # not learned the training distribution -- training had zero
+                # scale variance, every neuron baked to radius exactly 1. Record
+                # that as a diagnostic and leave the points alone. Renormalising
+                # here would hide a model failure and hand the baseline a repair
+                # it did not earn.
+                gen_radius = float(np.sqrt(
+                    ((points - points.mean(axis=0)) ** 2).sum(axis=1)).max())
+
                 point_swc_L1 = L1_medial(points=points, NCenters=2048,iters=1)
                 # Seed fps per-sample so the reconstruction is reproducible.
                 ske = point_swc_L1[fps(point_swc_L1, 1200, seed=opt.manualSeed + a), :] #(1200,3)
@@ -808,12 +869,25 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
                 stem = str(mid).replace('/', '__')
                 fname = f"{stem}.swc"
                 file_path = os.path.join(opt.generate_dir, fname)
+                sid = str(sids[j] if isinstance(sids, (list, tuple)) else sids[j])
+                gt_scale_m, gt_centroid = sidecars[(sid, str(mid))]
                 manifest.append({
                     'file': fname,
                     'mid': str(mid),
-                    'sid': str(sids[j] if isinstance(sids, (list, tuple)) else sids[j]),
+                    'sid': sid,
                     'cate_idx': int(y[j]),
                     'gen_index': a,
+                    # The PAIRED GT neuron's normalisation constants, i.e. S-oracle
+                    # input. Named gt_* so using them for the distributional table --
+                    # which plan section 5 forbids, since it scores the baseline on a
+                    # quantity we handed it -- is visible at the call site.
+                    'gt_scale_m': gt_scale_m,
+                    'gt_centroid': gt_centroid,
+                    # Max radial norm of the generated cloud. Training was
+                    # unit-sphere, so a model that has learned the distribution
+                    # emits ~1.0; a deviation is a training-health signal, not
+                    # a scale to correct for.
+                    'gen_radius': float(gen_radius),
                     'mean': [float(v) for v in m[j].flatten()],
                     'std': float(s[j].flatten()[0]),
                 })
@@ -824,9 +898,34 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
                         f.write(node_str + "\n")
 
     # Explicit generated -> source join for the evaluation harness.
+    # Envelope, not a bare list: the SWCs on disk are in UNIT-SPHERE coordinates
+    # (reconstruction runs there, and scale is restored downstream), so say so
+    # explicitly and give the adapter something to assert on rather than infer.
     with open(os.path.join(opt.generate_dir, 'manifest.json'), 'w') as f:
-        json.dump(manifest, f, indent=1)
+        json.dump({'version': 2,
+                   'space': 'unit_sphere',
+                   'scale_restored': False,
+                   'neurons': manifest}, f, indent=1)
     print(f"wrote {len(manifest)} neurons + manifest.json to {opt.generate_dir}")
+
+    # Training normalised every neuron to radius exactly 1, so a model that has
+    # learned the distribution emits ~1.0 here. Report it: it is the cheapest
+    # available read on whether the samples are in-distribution at all, and it
+    # is otherwise invisible now that reconstruction renormalises.
+    if manifest:
+        radii = np.array([r['gen_radius'] for r in manifest])
+        print('generated radius (training distribution is exactly 1.0): '
+              'median {:.3g}  p10 {:.3g}  p90 {:.3g}'.format(
+                  float(np.median(radii)), float(np.percentile(radii, 10)),
+                  float(np.percentile(radii, 90))))
+        if not 0.5 < float(np.median(radii)) < 2.0:
+            warnings.warn(
+                'generated clouds have median radius {:.3g} against a training '
+                'distribution of exactly 1.0 -- the samples are far out of '
+                'distribution, so detect_radius and length_threshold are being '
+                'applied at the wrong scale and the morphometrics are not '
+                'meaningful. Train longer; do not rescale here.'.format(
+                    float(np.median(radii))), RuntimeWarning)
     # BUGFIX: upstream returned `output_dir`, which is not defined in this scope --
     # a NameError raised AFTER the entire (very expensive) generation loop, discarding
     # the run. `outf_syn` is the directory this function actually writes under.
