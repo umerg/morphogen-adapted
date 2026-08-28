@@ -11,7 +11,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --signal=B:TERM@600
 #SBATCH --exclude=tikgpu10
-#CommentSBATCH --nodelist=tikgpu07
+#SBATCH --nodelist=tikgpu09
 #CommentSBATCH --account=tik-internal
 #CommentSBATCH --constraint='a100_80gb'
 
