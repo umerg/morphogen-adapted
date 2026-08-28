@@ -84,9 +84,17 @@ fi
 mkdir -p "${LOCAL}"
 export TMPDIR="${LOCAL}"
 
-# Only the staging copy is disposable -- checkpoints live on SHARE, so a kill at
-# any point loses at most SAVEITER epochs and the next submission resumes.
-cleanup() { [[ "${DATA:-}" != "${DATA_SRC}" ]] && rm -rf "${LOCAL}" || true; }
+# LOCAL is always disposable: it holds either a staging COPY of the corpus or just
+# TMPDIR, never the corpus itself (DATA_SRC is a different path by construction).
+# Checkpoints live on SHARE, so a kill at any point loses at most SAVEITER epochs
+# and the next submission resumes. Guarded against an unset/rootish LOCAL rather
+# than against DATA_SRC, which rm can never reach from here.
+cleanup() {
+  case "${LOCAL:-}" in
+    /scratch/*|/tmp/*|/var/folders/*) rm -rf "${LOCAL}" ;;
+    *) echo "not removing unexpected LOCAL=${LOCAL:-<unset>}" >&2 ;;
+  esac
+}
 trap cleanup EXIT
 trap 'echo "=== caught TERM (time limit approaching); checkpoints are on SHARE, resubmit to resume ==="' TERM
 
