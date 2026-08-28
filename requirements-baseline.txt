@@ -53,3 +53,7 @@ open3d>=0.17          # dataloader + utils/ske_connect.py (L1_medial)
 plyfile>=0.9          # sub_process.py; missing from upstream requirements.txt
 trimesh>=3.20         # utils/visualize.py
 morphopy>=0.7         # utils/utils.py
+
+# dendrite_gen eval side (validation/chamfer.py, validation/run_dist_metrics_cli.py).
+# Only needed on whichever env runs the metrics; the training half does not import it.
+persim>=0.3           # structural_metrics.bottleneck_distance -- TMD bottleneck

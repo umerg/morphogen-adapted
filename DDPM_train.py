@@ -647,13 +647,14 @@ def train(gpu, opt, output_dir, noises_init, train_dataset=None):
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     optimizer = torch.optim.AdamW(model.parameters(), lr=opt.lr, weight_decay=0)
 
+    # Loaded once, not twice: upstream called torch.load(opt.model) again just to
+    # read ['epoch'], paying the full checkpoint deserialisation a second time.
+    resumed = None
     if opt.model != '':
-        ckpt = torch.load(opt.model)
-        model.load_state_dict(ckpt['model_state'])
-        optimizer.load_state_dict(ckpt['optimizer_state'])
-
-    if opt.model != '':
-        start_epoch = torch.load(opt.model)['epoch'] + 1
+        resumed = torch.load(opt.model, map_location='cpu')
+        model.load_state_dict(resumed['model_state'])
+        optimizer.load_state_dict(resumed['optimizer_state'])
+        start_epoch = resumed['epoch'] + 1
     else:
         start_epoch = 0
 
@@ -665,7 +666,17 @@ def train(gpu, opt, output_dir, noises_init, train_dataset=None):
 
     # Prepare models for training:
     if opt.use_ema:
-        update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
+        if resumed is not None and 'ema' in resumed:
+            # RESTORE the averaged weights on resume. The decay=0 sync below sets EMA
+            # equal to the raw model, so doing it unconditionally threw away the saved
+            # average every time the job restarted -- meaning a run split across SLURM
+            # time limits would accumulate no averaging at all, while selection and
+            # generation both read EMA. Keys line up directly: `ema` is deepcopy'd
+            # before multi_gpu_wrapper and was saved in that same unwrapped form.
+            ema.load_state_dict(resumed['ema'])
+            print(f'resumed EMA from {opt.model}')
+        else:
+            update_ema(ema, model, decay=0)  # fresh start: initialise EMA to the model
         model.train()  # important! This enables embedding dropout for classifier-free guidance
         ema.eval()  # EMA model should always be in eval mode
 
