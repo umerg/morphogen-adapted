@@ -13,7 +13,8 @@
 #SBATCH --exclude=tikgpu10
 #CommentSBATCH --nodelist=tikgpu07
 #CommentSBATCH --account=tik-internal
-#CommentSBATCH --constraint='a100_80gb'
+# No --constraint: bs 128 fits in 24 GB, so any of the GPUs will do. A bs-256 arm
+# would need --constraint='a100_80gb'; see the table below before adding it back.
 
 #
 # Stage 6 -- Arm U (unconditional) training.
@@ -30,7 +31,7 @@
 #
 # BS = 128 (decided 2026-08-27). GPU memory vs bs:
 #   bs 128 -> ~24 GB   titan_rtx / v100_32gb -- WHAT WE RUN
-#   bs 256 -> ~40 GB   needs a100_80gb; uncomment the constraint line above
+#   bs 256 -> ~40 GB   would need --constraint='a100_80gb' (not requested here)
 #   bs 400 -> ~80 GB   the upstream default; not our budget
 #
 # What bs 128 does and does not claim, for the write-up:
