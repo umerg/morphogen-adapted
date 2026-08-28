@@ -28,13 +28,23 @@
 # probe runs a few epochs on the real corpus and prints the projected wall-clock
 # for the full run, so the --time and the arm choice are decided on a measurement.
 #
-# GPU MEMORY vs BS -- read before changing BS:
-#   bs 128 -> ~24 GB   (titan_rtx, v100_32gb)
-#   bs 256 -> ~40 GB   NEEDS a100_80gb; uncomment the constraint line above
-#   bs 400 -> ~80 GB   (the upstream default; not our budget)
-# bs 256 is the parity arm: it matches dendrite_gen's batch_size AND lands within
-# ~35% on gradient steps (26,700 vs 20,000). If no A100 is available, use bs 128
-# and say so -- the step count doubles to 53,400, which is a different arm.
+# BS = 128 (decided 2026-08-27). GPU memory vs bs:
+#   bs 128 -> ~24 GB   titan_rtx / v100_32gb -- WHAT WE RUN
+#   bs 256 -> ~40 GB   needs a100_80gb; uncomment the constraint line above
+#   bs 400 -> ~80 GB   the upstream default; not our budget
+#
+# What bs 128 does and does not claim, for the write-up:
+#   KEPT     epoch parity, E=300 -- the house rule from
+#            docs/BUDGET_PARITY_SEMLAFLOW.md is "match epochs, REPORT steps".
+#   LOST     the secondary batch-size match with dendrite_gen (128 vs 256) and
+#            with it the "within 35% on steps" claim: 300 x 177 = 53,100 steps
+#            against dendrite_gen's 20,000, i.e. 2.7x. Report the number; do not
+#            describe this arm as step-matched.
+#   NOTE     more, noisier updates at the same epoch budget is not a handicap for
+#            a diffusion model -- if anything it favours the baseline, which is
+#            the safe direction. lr stays at the published 1e-4; linear scaling
+#            would argue for 5e-5, but retuning the baseline's optimiser is an
+#            extra deviation we have no evidence we need.
 #
 # NOTE: torch must be a cu121 build. torch>=2.6 dropped cu121 wheels, so on a
 # 12.0-12.3 driver use torch==2.5.1 + torchvision==0.20.1. A newer build fails at
@@ -51,11 +61,12 @@ if [[ ! -d ${DATA_SRC}/neurons/train ]]; then
   DATA_SRC=${SHARE}/morphogen_npy
 fi
 RUNS=${RUNS:-${SHARE}/mg_runs}
-EXP=${EXP:-armU_P}
+EXP=${EXP:-armU_P_bs128}   # bs in the name: a later bs-256 arm must not
+                           # land in the same checkpoint directory
 
-# Arm P (parity): E=300 at bs 256 = 26,700 steps on 22,773 neurons.
+# Arm P (parity): E=300 at bs 128 = ~53,100 steps on 22,773 neurons (drop_last).
 # Arm L (best-effort): set NITER higher and stop when the selection curve flattens.
-BS=${BS:-256}
+BS=${BS:-128}
 NITER=${NITER:-300}
 SAVEITER=${SAVEITER:-10}          # selection grid must be at least as fine as this
 PROBE=${PROBE:-0}
