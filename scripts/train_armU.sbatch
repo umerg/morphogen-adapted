@@ -11,9 +11,31 @@
 #SBATCH --time=24:00:00
 #SBATCH --signal=B:TERM@600
 #SBATCH --exclude=tikgpu10
-#SBATCH --nodelist=tikgpu09
+#CommentSBATCH --nodelist=tikgpu05
 #CommentSBATCH --account=tik-internal
-#CommentSBATCH --constraint='a100_80gb'
+#
+# PICKING A GPU ON A MIXED NODE -- --constraint does NOT do this.
+#   --constraint matches node FEATURES, which are properties of the whole node.
+#   On a node holding both 24 GiB and 32 GiB cards every GPU has the same
+#   features, so a constraint selects the node you already have and cannot
+#   choose the card. --nodelist has the same problem: tikgpu05 is mixed, so
+#   pinning to it still hands out a 24 GiB card sometimes -- which is exactly
+#   how the 2026-08-28 run failed twice.
+#
+#   The mechanism that does work is the GRES TYPE:
+#       sbatch --gres=gpu:<type>:1 scripts/train_armU.sbatch
+#   overriding the #SBATCH --gres line below without editing this file.
+#
+#   Find <type> on the cluster -- do not guess, a wrong string pends forever:
+#       scontrol show node tikgpu05 | grep -E 'Gres|Features'
+#       sinfo -N -o '%N | gres:%G | features:%f'
+#   Use the exact lowercase token from `Gres=gpu:<type>:N`, e.g. `v100`, not a
+#   marketing name like 'Tesla V100'.
+#
+#   CAVEAT: V100 ships in 16 GiB and 32 GiB variants. If the cluster exposes
+#   both under one type string, the type alone will not guarantee 32 GiB. The
+#   preflight below is the backstop either way -- it reads the device that was
+#   actually allocated and refuses to start before the dataset load.
 
 #
 # Stage 6 -- Arm U (unconditional) training.
@@ -28,17 +50,24 @@
 # probe runs a few epochs on the real corpus and prints the projected wall-clock
 # for the full run, so the --time and the arm choice are decided on a measurement.
 #
-# BS = 128 (decided 2026-08-27). GPU memory vs bs:
-#   bs 128 -> ~24 GB   titan_rtx / v100_32gb -- WHAT WE RUN
-#   bs 256 -> ~40 GB   needs a100_80gb; uncomment the constraint line above
-#   bs 400 -> ~80 GB   the upstream default; not our budget
+# BS = 112. GPU memory, MEASURED 2026-08-28. The earlier table here was the
+# plan's estimate and it was WRONG -- bs 128 does not fit in 24 GB:
+#   activations ~0.179 GiB/sample, on top of ~0.49 GiB weights+grads+AdamW.
+#   bs  96 -> ~17.6 GiB   fits a 24 GiB card, more margin
+#   bs 112 -> ~20.5 GiB   fits a 24 GiB card with ~3 GiB spare -- WHAT WE RUN
+#   bs 128 -> ~23.4 GiB   OOMs a 23.64 GiB card; needs >=32 GiB
+#   bs 256 -> ~46.2 GiB   would need an a100_80gb
+#
+# bs 128 needs a 32 GiB card and tikgpu05 is mixed, so it could not be reserved
+# reliably -- two runs died that way. Settled on bs 112, which fits any card
+# here. Still epoch parity (E=300); report 60,900 steps, not 53,100.
 #
 # What bs 128 does and does not claim, for the write-up:
 #   KEPT     epoch parity, E=300 -- the house rule from
 #            docs/BUDGET_PARITY_SEMLAFLOW.md is "match epochs, REPORT steps".
-#   LOST     the secondary batch-size match with dendrite_gen (128 vs 256) and
-#            with it the "within 35% on steps" claim: 300 x 177 = 53,100 steps
-#            against dendrite_gen's 20,000, i.e. 2.7x. Report the number; do not
+#   LOST     the secondary batch-size match with dendrite_gen (112 vs 256) and
+#            with it the "within 35% on steps" claim: 300 x 203 = 60,900 steps
+#            against dendrite_gen's 20,000, i.e. 3.0x. Report the number; do not
 #            describe this arm as step-matched.
 #   NOTE     more, noisier updates at the same epoch budget is not a handicap for
 #            a diffusion model -- if anything it favours the baseline, which is
@@ -61,12 +90,12 @@ if [[ ! -d ${DATA_SRC}/neurons/train ]]; then
   DATA_SRC=${SHARE}/morphogen_npy
 fi
 RUNS=${RUNS:-${SHARE}/mg_runs}
-EXP=${EXP:-armU_P_bs128}   # bs in the name: a later bs-256 arm must not
+EXP=${EXP:-armU_P_bs112}   # bs in the name: a later bs-256 arm must not
                            # land in the same checkpoint directory
 
-# Arm P (parity): E=300 at bs 128 = ~53,100 steps on 22,773 neurons (drop_last).
+# Arm P (parity): E=300 at bs 112 = 203 steps/epoch = 60,900 steps on 22,773 neurons.
 # Arm L (best-effort): set NITER higher and stop when the selection curve flattens.
-BS=${BS:-128}
+BS=${BS:-112}
 NITER=${NITER:-300}
 SAVEITER=${SAVEITER:-10}          # selection grid must be at least as fine as this
 PROBE=${PROBE:-0}
@@ -83,9 +112,17 @@ fi
 mkdir -p "${LOCAL}"
 export TMPDIR="${LOCAL}"
 
-# Only the staging copy is disposable -- checkpoints live on SHARE, so a kill at
-# any point loses at most SAVEITER epochs and the next submission resumes.
-cleanup() { [[ "${DATA:-}" != "${DATA_SRC}" ]] && rm -rf "${LOCAL}" || true; }
+# LOCAL is always disposable: it holds either a staging COPY of the corpus or just
+# TMPDIR, never the corpus itself (DATA_SRC is a different path by construction).
+# Checkpoints live on SHARE, so a kill at any point loses at most SAVEITER epochs
+# and the next submission resumes. Guarded against an unset/rootish LOCAL rather
+# than against DATA_SRC, which rm can never reach from here.
+cleanup() {
+  case "${LOCAL:-}" in
+    /scratch/*|/tmp/*|/var/folders/*) rm -rf "${LOCAL}" ;;
+    *) echo "not removing unexpected LOCAL=${LOCAL:-<unset>}" >&2 ;;
+  esac
+}
 trap cleanup EXIT
 trap 'echo "=== caught TERM (time limit approaching); checkpoints are on SHARE, resubmit to resume ==="' TERM
 
@@ -100,6 +137,35 @@ cd ${DIRECTORY}
 python -u -c "import torch; print('torch', torch.__version__, '| cuda', torch.version.cuda,
       '|', torch.cuda.get_device_name(0),
       '| %.0f GB' % (torch.cuda.get_device_properties(0).total_memory/1e9))"
+
+# Cheap insurance against fragmentation; does not change the peak requirement.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# --- preflight: does BS fit on THIS GPU? -------------------------------------
+# Runs BEFORE the ~2.5 min dataset load. The alternative is what happened on
+# 2026-08-28: three minutes of setup, then OOM at step 0 with nothing written.
+python -u - <<PREFLIGHT
+import sys, torch
+PER_SAMPLE = 0.1786   # GiB/sample, from two measured points (OOM at 23.64, ran at 34)
+FIXED      = 0.49     # GiB: weights + grads + AdamW moments
+HEADROOM   = 1.0      # GiB for CUDA context, cuDNN workspace, fragmentation
+bs     = ${BS}
+total  = torch.cuda.get_device_properties(0).total_memory / 2**30
+need   = FIXED + PER_SAMPLE * bs
+budget = total - HEADROOM
+print('preflight: %s %.2f GiB | bs %d needs ~%.2f GiB | budget %.2f GiB'
+      % (torch.cuda.get_device_name(0), total, bs, need, budget))
+if need > budget:
+    safe = int((budget - FIXED) / PER_SAMPLE)
+    sys.exit(
+        'PREFLIGHT FAILED: bs %d does not fit on this GPU.\n'
+        '  Largest bs that fits here: %d.\n'
+        '  Either pin to a 32 GiB+ node (#SBATCH --nodelist=tikgpu05), or set\n'
+        '  BS=%d -- and REPORT it. A different batch size is a different arm,\n'
+        '  not a silent substitution: it changes steps/epoch and the step-count\n'
+        '  claim in the write-up.' % (bs, safe, safe))
+print('preflight OK')
+PREFLIGHT
 
 # --- stage the corpus --------------------------------------------------------
 if [[ ! -d ${DATA_SRC}/neurons/train ]]; then
