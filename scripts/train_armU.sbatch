@@ -11,10 +11,31 @@
 #SBATCH --time=24:00:00
 #SBATCH --signal=B:TERM@600
 #SBATCH --exclude=tikgpu10
-#CommentSBATCH --nodelist=tikgpu07
+#CommentSBATCH --nodelist=tikgpu05
 #CommentSBATCH --account=tik-internal
-# No --constraint: bs 128 fits in 24 GB, so any of the GPUs will do. A bs-256 arm
-# would need --constraint='a100_80gb'; see the table below before adding it back.
+#
+# PICKING A GPU ON A MIXED NODE -- --constraint does NOT do this.
+#   --constraint matches node FEATURES, which are properties of the whole node.
+#   On a node holding both 24 GiB and 32 GiB cards every GPU has the same
+#   features, so a constraint selects the node you already have and cannot
+#   choose the card. --nodelist has the same problem: tikgpu05 is mixed, so
+#   pinning to it still hands out a 24 GiB card sometimes -- which is exactly
+#   how the 2026-08-28 run failed twice.
+#
+#   The mechanism that does work is the GRES TYPE:
+#       sbatch --gres=gpu:<type>:1 scripts/train_armU.sbatch
+#   overriding the #SBATCH --gres line below without editing this file.
+#
+#   Find <type> on the cluster -- do not guess, a wrong string pends forever:
+#       scontrol show node tikgpu05 | grep -E 'Gres|Features'
+#       sinfo -N -o '%N | gres:%G | features:%f'
+#   Use the exact lowercase token from `Gres=gpu:<type>:N`, e.g. `v100`, not a
+#   marketing name like 'Tesla V100'.
+#
+#   CAVEAT: V100 ships in 16 GiB and 32 GiB variants. If the cluster exposes
+#   both under one type string, the type alone will not guarantee 32 GiB. The
+#   preflight below is the backstop either way -- it reads the device that was
+#   actually allocated and refuses to start before the dataset load.
 
 #
 # Stage 6 -- Arm U (unconditional) training.
@@ -36,9 +57,12 @@
 #   bs 112 -> ~20.5 GiB   fits, tight
 #   bs 128 -> ~23.4 GiB   OOMs a 23.64 GiB card; needs >=32 GiB
 #   bs 256 -> ~46.2 GiB   would need an a100_80gb
-# bs 128 therefore requires a 32 GiB+ node. tikgpu05 (Tesla V100-PCIE-32GB) is
-# confirmed good -- uncomment the --nodelist line above to pin there. The
-# preflight below refuses to start rather than OOMing after the dataset load.
+#
+# bs 128 therefore needs a 32 GiB card, which on a mixed node must be requested
+# by GRES type (see the block above), not by --constraint or --nodelist.
+# If a 32 GiB card cannot be reserved reliably, BS=112 (~20.5 GiB) fits any
+# 24 GiB card with ~3 GiB spare: 203 steps/epoch, 60,900 steps at E=300. That is
+# still epoch parity -- report the step count and move on.
 #
 # What bs 128 does and does not claim, for the write-up:
 #   KEPT     epoch parity, E=300 -- the house rule from
