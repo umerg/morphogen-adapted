@@ -29,10 +29,16 @@
 # probe runs a few epochs on the real corpus and prints the projected wall-clock
 # for the full run, so the --time and the arm choice are decided on a measurement.
 #
-# BS = 128 (decided 2026-08-27). GPU memory vs bs:
-#   bs 128 -> ~24 GB   titan_rtx / v100_32gb -- WHAT WE RUN
-#   bs 256 -> ~40 GB   would need --constraint='a100_80gb' (not requested here)
-#   bs 400 -> ~80 GB   the upstream default; not our budget
+# BS = 128. GPU memory, MEASURED 2026-08-28. The earlier table here was the
+# plan's estimate and it was WRONG -- bs 128 does not fit in 24 GB:
+#   activations ~0.179 GiB/sample, on top of ~0.49 GiB weights+grads+AdamW.
+#   bs  96 -> ~17.6 GiB   fits a 24 GiB card
+#   bs 112 -> ~20.5 GiB   fits, tight
+#   bs 128 -> ~23.4 GiB   OOMs a 23.64 GiB card; needs >=32 GiB
+#   bs 256 -> ~46.2 GiB   would need an a100_80gb
+# bs 128 therefore requires a 32 GiB+ node. tikgpu05 (Tesla V100-PCIE-32GB) is
+# confirmed good -- uncomment the --nodelist line above to pin there. The
+# preflight below refuses to start rather than OOMing after the dataset load.
 #
 # What bs 128 does and does not claim, for the write-up:
 #   KEPT     epoch parity, E=300 -- the house rule from
@@ -109,6 +115,35 @@ cd ${DIRECTORY}
 python -u -c "import torch; print('torch', torch.__version__, '| cuda', torch.version.cuda,
       '|', torch.cuda.get_device_name(0),
       '| %.0f GB' % (torch.cuda.get_device_properties(0).total_memory/1e9))"
+
+# Cheap insurance against fragmentation; does not change the peak requirement.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# --- preflight: does BS fit on THIS GPU? -------------------------------------
+# Runs BEFORE the ~2.5 min dataset load. The alternative is what happened on
+# 2026-08-28: three minutes of setup, then OOM at step 0 with nothing written.
+python -u - <<PREFLIGHT
+import sys, torch
+PER_SAMPLE = 0.1786   # GiB/sample, from two measured points (OOM at 23.64, ran at 34)
+FIXED      = 0.49     # GiB: weights + grads + AdamW moments
+HEADROOM   = 1.0      # GiB for CUDA context, cuDNN workspace, fragmentation
+bs     = ${BS}
+total  = torch.cuda.get_device_properties(0).total_memory / 2**30
+need   = FIXED + PER_SAMPLE * bs
+budget = total - HEADROOM
+print('preflight: %s %.2f GiB | bs %d needs ~%.2f GiB | budget %.2f GiB'
+      % (torch.cuda.get_device_name(0), total, bs, need, budget))
+if need > budget:
+    safe = int((budget - FIXED) / PER_SAMPLE)
+    sys.exit(
+        'PREFLIGHT FAILED: bs %d does not fit on this GPU.\n'
+        '  Largest bs that fits here: %d.\n'
+        '  Either pin to a 32 GiB+ node (#SBATCH --nodelist=tikgpu05), or set\n'
+        '  BS=%d -- and REPORT it. A different batch size is a different arm,\n'
+        '  not a silent substitution: it changes steps/epoch and the step-count\n'
+        '  claim in the write-up.' % (bs, safe, safe))
+print('preflight OK')
+PREFLIGHT
 
 # --- stage the corpus --------------------------------------------------------
 if [[ ! -d ${DATA_SRC}/neurons/train ]]; then
