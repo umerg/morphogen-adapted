@@ -50,26 +50,24 @@
 # probe runs a few epochs on the real corpus and prints the projected wall-clock
 # for the full run, so the --time and the arm choice are decided on a measurement.
 #
-# BS = 128. GPU memory, MEASURED 2026-08-28. The earlier table here was the
+# BS = 112. GPU memory, MEASURED 2026-08-28. The earlier table here was the
 # plan's estimate and it was WRONG -- bs 128 does not fit in 24 GB:
 #   activations ~0.179 GiB/sample, on top of ~0.49 GiB weights+grads+AdamW.
-#   bs  96 -> ~17.6 GiB   fits a 24 GiB card
-#   bs 112 -> ~20.5 GiB   fits, tight
+#   bs  96 -> ~17.6 GiB   fits a 24 GiB card, more margin
+#   bs 112 -> ~20.5 GiB   fits a 24 GiB card with ~3 GiB spare -- WHAT WE RUN
 #   bs 128 -> ~23.4 GiB   OOMs a 23.64 GiB card; needs >=32 GiB
 #   bs 256 -> ~46.2 GiB   would need an a100_80gb
 #
-# bs 128 therefore needs a 32 GiB card, which on a mixed node must be requested
-# by GRES type (see the block above), not by --constraint or --nodelist.
-# If a 32 GiB card cannot be reserved reliably, BS=112 (~20.5 GiB) fits any
-# 24 GiB card with ~3 GiB spare: 203 steps/epoch, 60,900 steps at E=300. That is
-# still epoch parity -- report the step count and move on.
+# bs 128 needs a 32 GiB card and tikgpu05 is mixed, so it could not be reserved
+# reliably -- two runs died that way. Settled on bs 112, which fits any card
+# here. Still epoch parity (E=300); report 60,900 steps, not 53,100.
 #
 # What bs 128 does and does not claim, for the write-up:
 #   KEPT     epoch parity, E=300 -- the house rule from
 #            docs/BUDGET_PARITY_SEMLAFLOW.md is "match epochs, REPORT steps".
-#   LOST     the secondary batch-size match with dendrite_gen (128 vs 256) and
-#            with it the "within 35% on steps" claim: 300 x 177 = 53,100 steps
-#            against dendrite_gen's 20,000, i.e. 2.7x. Report the number; do not
+#   LOST     the secondary batch-size match with dendrite_gen (112 vs 256) and
+#            with it the "within 35% on steps" claim: 300 x 203 = 60,900 steps
+#            against dendrite_gen's 20,000, i.e. 3.0x. Report the number; do not
 #            describe this arm as step-matched.
 #   NOTE     more, noisier updates at the same epoch budget is not a handicap for
 #            a diffusion model -- if anything it favours the baseline, which is
@@ -92,12 +90,12 @@ if [[ ! -d ${DATA_SRC}/neurons/train ]]; then
   DATA_SRC=${SHARE}/morphogen_npy
 fi
 RUNS=${RUNS:-${SHARE}/mg_runs}
-EXP=${EXP:-armU_P_bs128}   # bs in the name: a later bs-256 arm must not
+EXP=${EXP:-armU_P_bs112}   # bs in the name: a later bs-256 arm must not
                            # land in the same checkpoint directory
 
-# Arm P (parity): E=300 at bs 128 = ~53,100 steps on 22,773 neurons (drop_last).
+# Arm P (parity): E=300 at bs 112 = 203 steps/epoch = 60,900 steps on 22,773 neurons.
 # Arm L (best-effort): set NITER higher and stop when the selection curve flattens.
-BS=${BS:-128}
+BS=${BS:-112}
 NITER=${NITER:-300}
 SAVEITER=${SAVEITER:-10}          # selection grid must be at least as fine as this
 PROBE=${PROBE:-0}
