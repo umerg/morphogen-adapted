@@ -1184,10 +1184,19 @@ def test(gpu, opt, output_dir):
 
 
     elif opt.distribution_type == 'single':
-        def _transform_(m):
-            return nn.parallel.DataParallel(m)
-        model = model.cuda()
-        model.multi_gpu_wrapper(_transform_)
+        # 'single' is the default, and it called .cuda() unconditionally -- so
+        # generation died with "Torch not compiled with CUDA enabled" on any
+        # CPU-only machine, before a single sample. The model is already on the
+        # right device from the model.to(device) above; DataParallel over CPU is
+        # meaningless, so on CPU just leave it alone. The EMA key remap below
+        # already handles both the wrapped and unwrapped layouts.
+        if torch.cuda.is_available():
+            def _transform_(m):
+                return nn.parallel.DataParallel(m)
+            model = model.cuda()
+            model.multi_gpu_wrapper(_transform_)
+        else:
+            print('CUDA unavailable: running on CPU, no DataParallel wrapper')
 
     elif gpu is not None:
         torch.cuda.set_device(gpu)
