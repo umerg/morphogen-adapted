@@ -155,8 +155,10 @@ def to_tensor(clouds: list[np.ndarray], npoints: int, seed: int) -> torch.Tensor
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--clouds', type=Path, required=True,
-                    help='directory of generated .npy clouds (<gen_dir>/clouds)')
+    ap.add_argument('--clouds', type=Path, default=None,
+                    help='directory of generated .npy clouds (<gen_dir>/clouds). Omit to '
+                         'profile --ref-npy-root alone, which is how the GT baseline is '
+                         'measured before any model has been sampled.')
     ap.add_argument('--ref-npy-root', type=Path, default=None,
                     help='the SYNSET dir of the bake, e.g. <bake>/neurons')
     ap.add_argument('--ref-split', default='val')
@@ -171,29 +173,38 @@ def main() -> None:
     ap.add_argument('--output-json', type=Path, default=None)
     args = ap.parse_args()
 
-    gen, names = load_generated(args.clouds)
-    print(f'generated clouds : {len(gen)} from {args.clouds}')
+    if args.clouds is None and args.ref_npy_root is None:
+        raise SystemExit('pass --clouds, --ref-npy-root, or both')
 
-    radii = np.array([gen_radius(P) for P in gen])
-    lin = np.array([linearity(P) for P in gen])
-    out = {
-        'n_generated': len(gen),
-        'gen_radius': {'median': float(np.median(radii)),
-                       'p10': float(np.percentile(radii, 10)),
-                       'p90': float(np.percentile(radii, 90))},
-        'linearity': float(lin[:, 0].mean()),
-        'nn_spacing': float(lin[:, 1].mean()),
-    }
-    print('\n=== cloud health (no reconstruction) ===')
-    print('  gen_radius        median %.3g  p10 %.3g  p90 %.3g   (training target: exactly 1.0)'
-          % (out['gen_radius']['median'], out['gen_radius']['p10'], out['gen_radius']['p90']))
-    print('  linearity         %.3f   (1.0 = points on a tube, 0.333 = isotropic blob)'
-          % out['linearity'])
-    print('  NN spacing        %.4f  (unit sphere)' % out['nn_spacing'])
-    if not 0.5 < out['gen_radius']['median'] < 2.0:
-        print('  WARNING: far out of distribution. detect_radius and length_threshold are '
-              'unit-sphere constants, so any morphometric from these clouds is an artifact '
-              'of the wrong scale. Reject this checkpoint before reconstructing it.')
+    out: dict = {}
+    gen = None
+    if args.clouds is not None:
+        gen, _ = load_generated(args.clouds)
+        print(f'generated clouds : {len(gen)} from {args.clouds}')
+
+        radii = np.array([gen_radius(P) for P in gen])
+        lin = np.array([linearity(P) for P in gen])
+        out.update({
+            'n_generated': len(gen),
+            'gen_radius': {'median': float(np.median(radii)),
+                           'p10': float(np.percentile(radii, 10)),
+                           'p90': float(np.percentile(radii, 90))},
+            'linearity': float(lin[:, 0].mean()),
+            'nn_spacing': float(lin[:, 1].mean()),
+        })
+        print('\n=== cloud health (no reconstruction) ===')
+        print('  gen_radius        median %.3g  p10 %.3g  p90 %.3g   '
+              '(training target: exactly 1.0)'
+              % (out['gen_radius']['median'], out['gen_radius']['p10'],
+                 out['gen_radius']['p90']))
+        print('  linearity         %.3f   (1.0 = points on a tube, 0.333 = isotropic blob)'
+              % out['linearity'])
+        print('  NN spacing        %.4f  (unit sphere)' % out['nn_spacing'])
+        if not 0.5 < out['gen_radius']['median'] < 2.0:
+            print('  WARNING: far out of distribution. detect_radius and length_threshold '
+                  'are unit-sphere constants, so any morphometric from these clouds is an '
+                  'artifact of the wrong scale. Reject this checkpoint before '
+                  'reconstructing it.')
 
     if args.ref_npy_root:
         ref = load_reference(args.ref_npy_root, args.ref_split, args.npoints,
@@ -205,8 +216,18 @@ def main() -> None:
         print('\n=== reference (%s, n=%d) ===' % (args.ref_split, len(ref)))
         print('  linearity         %.3f' % out['reference']['linearity'])
         print('  NN spacing        %.4f' % out['reference']['nn_spacing'])
-        print('  generated retains %.0f%% of reference linearity'
-              % (100 * out['linearity'] / max(out['reference']['linearity'], 1e-9)))
+        if gen is not None:
+            print('  generated retains %.0f%% of reference linearity'
+                  % (100 * out['linearity'] / max(out['reference']['linearity'], 1e-9)))
+
+        if gen is None:
+            # Reference-only run: this is how the GT baseline is established before a
+            # model exists to compare against. Nothing below has a sample side.
+            if args.output_json:
+                args.output_json.parent.mkdir(parents=True, exist_ok=True)
+                args.output_json.write_text(json.dumps(out, indent=2, default=float))
+                print(f'\nwrote {args.output_json}')
+            return
 
         out['cd'] = {}
         print('\n=== MorphoGen\'s own metric (paper Tab. 2 uses 128 points) ===')
