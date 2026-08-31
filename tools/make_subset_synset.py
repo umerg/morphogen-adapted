@@ -5,11 +5,15 @@ Arm S (plan Stage 6b) trains on ~690 neurons of one cell class at Arm P's exact
 gradient-step budget, so per-neuron exposure rises ~34x and nothing else about the
 budget changes. That needs a corpus directory holding only those neurons.
 
-Nothing has to be re-baked to get one. `scripts/bake.sbatch:133` passes
-`--label-root`, so every `.meta.json` beside a baked `.npy` already carries an
-integer `cell_class` (`tools/swc_to_morphogen_npy.py:64` `read_cell_class`). This
-reads those sidecars, picks a class, and copies the selected neurons into a fresh
+Nothing has to be re-baked to get one. This reads the `.meta.json` sidecars beside
+the baked `.npy` files, picks a class, and copies the selected neurons into a fresh
 synset tree.
+
+**The 2026-08 bake carries `cell_class: null` everywhere** (plan section 11 Stage 5)
+even though `scripts/bake.sbatch:133` passes `--label-root` -- the labels never
+reached the sidecars. They are not lost: they live in the labelled SWC corpus and
+join on filename, so `--label-root` recovers them here. The point clouds are
+untouched by this; it is purely an annotation that went missing.
 
 Two deliberate choices:
 
@@ -23,11 +27,13 @@ Two deliberate choices:
 Usage
 -----
   # 1. what classes are there, and how many of each?
-  python tools/make_subset_synset.py --npy-root <bake> --counts
+  python tools/make_subset_synset.py --npy-root <bake> \\
+      --label-root <share>/neurons_conditional_full --counts
 
   # 2. build the subset
   python tools/make_subset_synset.py --npy-root <bake> \\
-      --out-root <bake>_c3_690 --cell-class 3 --n 690
+      --label-root <share>/neurons_conditional_full \\
+      --out-root <bake>_c0_690 --cell-class 0 --n 690
 """
 from __future__ import annotations
 
@@ -39,6 +45,10 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from tools.swc_to_morphogen_npy import read_cell_class  # noqa: E402
 
 SPLITS = ('train', 'val')
 NPOINTS = 15000
@@ -53,9 +63,19 @@ def meta_path(npy: Path) -> Path:
     return npy.parent / (npy.name[:-len('.npy')] + '.meta.json')
 
 
-def scan(npy_root: Path, synset: str) -> dict[str, list[tuple[Path, int | None]]]:
-    """Every baked neuron per split, with its cell_class read from the sidecar."""
+def scan(npy_root: Path, synset: str,
+         label_root: Path | None = None) -> dict[str, list[tuple[Path, int | None]]]:
+    """Every baked neuron per split, with its cell_class.
+
+    Read from the sidecar when it is there. The 2026-08 bake ran with a
+    --label-root the baker could not use, so every sidecar carries
+    `cell_class: null` (plan section 11 Stage 5) -- and the labels are NOT lost, they
+    live in the labelled SWC corpus and join on filename. Passing --label-root
+    recovers them without re-baking a single point cloud: the .npy files are fine,
+    it is only the annotation that is missing.
+    """
     out: dict[str, list[tuple[Path, int | None]]] = {}
+    n_recovered = 0
     for split in SPLITS:
         d = npy_root / synset / split
         if not d.is_dir():
@@ -68,10 +88,18 @@ def scan(npy_root: Path, synset: str) -> dict[str, list[tuple[Path, int | None]]
                     f'{npy} has no sidecar at {mp}. The bake is incomplete; a subset '
                     'cannot be built without scale_m/centroid for every neuron.')
             meta = json.loads(mp.read_text())
-            rows.append((npy, meta.get('cell_class')))
+            cls = meta.get('cell_class')
+            if cls is None and label_root is not None:
+                stem = npy.name[:-len('.npy')]
+                cls = read_cell_class(label_root / split / f'{stem}.swc')
+                if cls is not None:
+                    n_recovered += 1
+            rows.append((npy, cls))
         if not rows:
             raise SystemExit(f'{d} contains no .npy files')
         out[split] = rows
+    if n_recovered:
+        print(f'recovered {n_recovered} labels from {label_root} by filename join')
     return out
 
 
@@ -95,10 +123,16 @@ def require_labels(scanned) -> None:
         n_null = sum(1 for _, cls in rows if cls is None)
         if n_null == len(rows):
             raise SystemExit(
-                f'every sidecar under {split} has cell_class=null -- this bake ran '
-                'without --label-root, so it carries no labels and a single-class '
-                'subset cannot be built from it. Re-bake with --label-root, or use '
-                'a class-balanced random subset instead.')
+                f'every sidecar under {split} has cell_class=null, and no labels were '
+                'recovered.\n'
+                '  The .npy clouds are fine -- only the annotation is missing, and it '
+                'joins by filename.\n'
+                '  Pass --label-root <labelled SWC corpus> (e.g. '
+                '.../neurons_conditional_full);\n'
+                '  re-baking is NOT needed. If --label-root was already passed, the '
+                'filename join\n'
+                '  found nothing: check that <label-root>/<split>/<stem>.swc exists and '
+                'carries a\n  leading "# cell_class N" comment.')
         if n_null:
             raise SystemExit(
                 f'{n_null}/{len(rows)} sidecars under {split} have cell_class=null. '
@@ -106,10 +140,20 @@ def require_labels(scanned) -> None:
                 'downstream; fix the bake first.')
 
 
-def copy_neuron(npy: Path, dst_dir: Path) -> None:
+def copy_neuron(npy: Path, dst_dir: Path, cell_class: int | None = None) -> None:
     shutil.copy2(npy, dst_dir / npy.name)
     mp = meta_path(npy)
-    shutil.copy2(mp, dst_dir / mp.name)
+    dst_meta = dst_dir / mp.name
+    shutil.copy2(mp, dst_meta)
+    if cell_class is not None:
+        # Write the resolved label into the COPY, never the source bake. Without this
+        # the subset would still read as unlabelled, and Arm C later needs the label
+        # to reach `cate_idx`.
+        meta = json.loads(dst_meta.read_text())
+        if meta.get('cell_class') is None:
+            meta['cell_class'] = cell_class
+            meta['cell_class_source'] = 'filename join (--label-root)'
+            dst_meta.write_text(json.dumps(meta))
 
 
 def main() -> None:
@@ -128,11 +172,15 @@ def main() -> None:
                     help='train neurons to select (0 = all of that class). 690 matches '
                          'the paper: ~690-760 train neurons per model.')
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--label-root', type=Path, default=None,
+                    help='labelled SWC corpus (e.g. .../neurons_conditional_full). '
+                         'Use when the bake sidecars carry cell_class=null: labels are '
+                         'joined by filename, so nothing has to be re-baked.')
     ap.add_argument('--counts', action='store_true',
                     help='report the class histogram and exit, changing nothing')
     args = ap.parse_args()
 
-    scanned = scan(args.npy_root, args.synset)
+    scanned = scan(args.npy_root, args.synset, args.label_root)
     report_counts(scanned)
     if args.counts:
         return
@@ -175,7 +223,7 @@ def main() -> None:
         dst = args.out_root / out_synset / split
         dst.mkdir(parents=True, exist_ok=True)
         for i, npy in enumerate(files, 1):
-            copy_neuron(npy, dst)
+            copy_neuron(npy, dst, args.cell_class)
             if i % 100 == 0 or i == len(files):
                 print(f'  {split}: {i}/{len(files)}', flush=True)
 

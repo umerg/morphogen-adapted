@@ -91,6 +91,11 @@ if [[ ! -d ${DATA_SRC}/neurons/train ]]; then
 fi
 RUNS=${RUNS:-${SHARE}/mg_runs}
 
+# The 2026-08 bake carries cell_class=null in every sidecar (plan section 11 Stage 5),
+# even though bake.sbatch passed --label-root -- the labels never reached them. They
+# are not lost: they join by filename from the labelled SWC corpus, so this recovers
+# them at subset-build time. No re-bake; the point clouds were never the problem.
+LABEL_SRC=${LABEL_SRC:-${SHARE}/neurons_conditional_full}
 CELL_CLASS=${CELL_CLASS:-0}          # 0 = 23P
 N_TRAIN=${N_TRAIN:-690}              # paper: ~690-760 train neurons per model
 SUBSET_SEED=${SUBSET_SEED:-0}
@@ -185,9 +190,17 @@ echo "=== full bake: ${DATA_SRC} ==="
 # it is byte-identical on every node and every resubmission.
 SUBSET=${LOCAL}/subset
 echo "=== building the class-${CELL_CLASS} subset (n=${N_TRAIN}, seed=${SUBSET_SEED}) ==="
+LABEL_ARG=""
+if [[ -d ${LABEL_SRC} ]]; then
+  LABEL_ARG="--label-root ${LABEL_SRC}"
+else
+  echo "WARNING: no labelled corpus at ${LABEL_SRC}; if the bake sidecars are" >&2
+  echo "  unlabelled the build below will abort. Pass LABEL_SRC=<path>." >&2
+fi
 python -u tools/make_subset_synset.py \
   --npy-root "${DATA_SRC}" \
   --out-root "${SUBSET}" \
+  ${LABEL_ARG} \
   --cell-class ${CELL_CLASS} \
   --n ${N_TRAIN} --seed ${SUBSET_SEED}
 
@@ -362,7 +375,8 @@ cat <<NEXT
 === next: sample and score, no reconstruction needed ===
   # rebuild the identical subset (same flags -> same 690 neurons):
   python tools/make_subset_synset.py --npy-root ${DATA_SRC} \\
-      --out-root \$SUBSET --cell-class ${CELL_CLASS} --n ${N_TRAIN} --seed ${SUBSET_SEED}
+      --label-root ${LABEL_SRC} --out-root \$SUBSET \\
+      --cell-class ${CELL_CLASS} --n ${N_TRAIN} --seed ${SUBSET_SEED}
   python -u morphology_gen.py --stage sample --max_samples 150 \\
       --dataroot \$SUBSET --category neurons \\
       --model ${OUT}/epoch_${LAST_EPOCH}.pth \\
