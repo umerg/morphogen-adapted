@@ -23,6 +23,7 @@ import json
 from scipy.spatial import distance_matrix, KDTree
 from utils.ske_connect import *
 import heapq
+import random
 from sklearn.decomposition import PCA
 from utils.cut import filter_short_branches
 from utils.utils import load_neuron
@@ -755,30 +756,120 @@ def load_sidecars(dataroot, cate_mids):
     return out
 
 
-def generate_eval(model, opt, gpu, outf_syn, evaluator):
+# --- Stage 7: reconstruction, as a separate CPU phase -------------------------
+# Reconstruction is pure-Python NumPy at ~4.2 s/neuron and is the pipeline's
+# dominant cost; sampling is GPU and cheap. Upstream fuses them in one loop, so
+# the GPU sits idle for ~3 CPU-hours per checkpoint on a 2,529-neuron split and a
+# crash in either half discards the entire run. Splitting them also means a
+# tau/gamma re-sweep costs no GPU at all -- the clouds are already on disk.
+#
+# These live at module level so a multiprocessing Pool can pickle them.
+_AUX_MODEL = None
+_RECON_KW = None
 
-    _, test_dataset = get_dataset(opt.dataroot, opt.npoints, opt.category)
 
-    _, test_dataloader, _, test_sampler = get_dataloader(opt, test_dataset, test_dataset)
+def aux_model_path(opt):
+    """The auxiliary ResNet weight.
 
-    aux_model = ResNet18()
-    # BUGFIX: upstream pointed at './temp/resnet16model.pth', which is not in the release.
-    # The shipped auxiliary weight is trained_model/Auxiliary.pth (resolved relative to
-    # this file so the CWD does not matter). Override with --aux_model.
-    _aux_ckpt = getattr(opt, 'aux_model', '') or os.path.join(
+    BUGFIX: upstream pointed at './temp/resnet16model.pth', which is not in the
+    release. The shipped weight is trained_model/Auxiliary.pth, resolved relative
+    to this file so the CWD does not matter. Override with --aux_model.
+    """
+    return getattr(opt, 'aux_model', '') or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'trained_model', 'Auxiliary.pth')
-    aux_model.load_state_dict(torch.load(_aux_ckpt, map_location='cpu'))
+
+
+def load_aux_model(path):
+    aux_model = ResNet18()
+    aux_model.load_state_dict(torch.load(path, map_location='cpu'))
     aux_model.eval()
+    return aux_model
+
+
+def _recon_init(aux_path, kw):
+    """Pool initialiser: load the ResNet once per worker, not once per neuron."""
+    global _AUX_MODEL, _RECON_KW
+    # Each worker is its own process, so leaving torch at its default thread count
+    # oversubscribes the node by workers x cores and makes the pool slower than
+    # serial. The work here is NumPy-bound anyway.
+    torch.set_num_threads(1)
+    _AUX_MODEL = load_aux_model(aux_path)
+    _RECON_KW = kw
+
+
+def reconstruct_one(job):
+    """One generated cloud -> SWC node rows. Pure CPU: no CUDA, no dataloader.
+
+    The fps seed is derived from the neuron's `gen_index`, not from its position
+    in this worker's queue, so the output is identical whether reconstruction runs
+    serially, across a pool, or resumed halfway through an interrupted job.
+    """
+    npy_path, seed = job
+    kw = _RECON_KW
+
+    # BUGFIX / determinism. auxi -> easy_fetch_resample -> resample_branch_by_step
+    # -> farthest_point_sample_faster (utils/utils.py:28) picks its FIRST point with
+    # an unseeded np.random.randint, so every branch longer than 32 points is
+    # resampled from a random start. Same class of bug as the L1_medial one already
+    # in the deviations table, and it is what made two calls to auxi on identical
+    # input differ by ~6e-2 -- the source of the reconstruction jitter recorded as
+    # an open item (mean_branch_length moving ~4e-3 between runs).
+    #
+    # A process-level seed hid it: morphology_gen seeds at startup, so a serial run
+    # consumes one deterministic stream and reproduces itself exactly. That breaks
+    # the moment reconstruction is parallel or resumed, because the stream is then
+    # split differently. Seeding per neuron makes each reconstruction a pure
+    # function of (cloud, seed) -- identical serial, pooled, or resumed.
+    random.seed(seed)
+    np.random.seed(seed % (2 ** 32))
+
+    # float64, matching tools/recon_ref.py:141. The calibrated constants
+    # (detect_radius 0.30, gamma_seed 0.40, tau 0.30) were fitted through that path,
+    # and RECON-REF is only comparable to generation if both run the same numerics.
+    # The fused upstream loop fed float32 straight off the torch tensor.
+    points = np.load(npy_path).astype(np.float64)
+
+    # BUGFIX: the generation path called L1_medial with no seed, so its centre
+    # initialisation drew from the numpy GLOBAL rng and two runs on identical
+    # input produced different skeletons. tools/recon_ref.py was fixed for this;
+    # this call site was missed. It bites twice here: a resumed or parallel
+    # reconstruction would not match a serial one, and a checkpoint sweep would
+    # be measuring L1 noise alongside real differences between checkpoints.
+    point_swc_L1 = L1_medial(points=points, NCenters=2048, iters=1, seed=seed)
+    ske = point_swc_L1[fps(point_swc_L1, 1200, seed=seed), :]      # (1200, 3)
+    connect = neuron_swc_generator(
+        ske,
+        detect_radius=kw['detect_radius'],
+        root_cap=kw['root_cap'],
+        gamma_seed=kw['gamma_seed'],
+        gamma_main=kw['gamma_main'],
+    )                                                              # (1200, 7)
+    cut = [
+        {'n': int(row[0]), 'type': int(row[1]), 'x': row[2], 'y': row[3],
+         'z': row[4], 'radius': row[5], 'parent': int(row[6])}
+        for row in connect
+    ]
+    cut = filter_short_branches(cut, length_threshold=kw['length_threshold'])
+    return auxi(pd.DataFrame(cut), _AUX_MODEL)
+
+
+def clouds_dir_for(opt):
+    return getattr(opt, 'clouds_dir', '') or os.path.join(opt.generate_dir, 'clouds')
+
+
+def sample_clouds(model, opt, gpu):
+    """Phase 1 (GPU): DDPM ancestral sampling -> one .npy per neuron + an index.
+
+    Writes unit-sphere clouds. `gen * s + m` inverts the dataset-global
+    standardisation and lands back in the space detect_radius and
+    length_threshold were calibrated in; no per-neuron rescale happens here or
+    anywhere (see the gen_radius note below).
+    """
+    _, test_dataset = get_dataset(opt.dataroot, opt.npoints, opt.category)
+    _, test_dataloader, _, _ = get_dataloader(opt, test_dataset, test_dataset)
 
     def new_y_chain(device, num_chain, num_classes):
-        return torch.randint(low=0,high=num_classes,size=(num_chain,),device=device)
-    
-    # The dataset applies a deterministic shuffle (random.Random(38383)), so the i-th
-    # generated sample is NOT the i-th file of the split. Downstream evaluation pairs
-    # gen[i] with a filename-sorted ground-truth list, so naming outputs by a running
-    # counter silently pairs every neuron with an arbitrary other one. Name each output
-    # by its source `mid` and emit a manifest so the join is explicit.
-    manifest = []
+        return torch.randint(low=0, high=num_classes, size=(num_chain,), device=device)
 
     # Per-neuron scale, for the adapter to restore with. pc_normlize divided each
     # baked neuron by its own max radial norm and the .npy kept only the points, so
@@ -787,30 +878,46 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
     # <dataroot>/<sid>/<mid>.meta.json -- rather than by carrying a side array through
     # the dataset, whose three index spaces (pre-shuffle entries, shuffle order,
     # post-skip n_written) make an index-keyed array silently misalign. That is the
-    # very failure this manifest exists to prevent.
+    # very failure the manifest exists to prevent.
     #
     # Preloaded up front, so a missing sidecar fails in the first second instead of
-    # after hours of sampling and reconstruction.
+    # after hours of sampling.
     sidecars = load_sidecars(opt.dataroot, test_dataset.all_cate_mids)
     print(f'loaded {len(sidecars)} bake sidecars for scale restoration')
 
-    with torch.no_grad():
+    cdir = clouds_dir_for(opt)
+    os.makedirs(cdir, exist_ok=True)
 
-        samples = []
-        a = 0
-        for i, data in tqdm(enumerate(test_dataloader), total=len(test_dataloader), desc='Generating Samples'):
-            x = data['test_points'].transpose(1,2)
+    cap = int(getattr(opt, 'max_samples', 0) or 0)
+    if cap:
+        # The test loader does not shuffle and the dataset's own shuffle is seeded,
+        # so the first `cap` samples are the SAME subset for every checkpoint. That
+        # is the property a selection sweep needs; a random subset per checkpoint
+        # would make the comparison between checkpoints meaningless.
+        print(f'--max_samples {cap}: generating a fixed prefix of the split, '
+              f'not the full {len(test_dataset)} neurons')
+
+    index = []
+    a = 0
+    with torch.no_grad():
+        for i, data in tqdm(enumerate(test_dataloader), total=len(test_dataloader),
+                            desc='Sampling clouds'):
+            if cap and a >= cap:
+                break
+            x = data['test_points'].transpose(1, 2)
             m, s = data['mean'].float(), data['std'].float()
             y = data['cate_idx']
-            mids = data['mid']
-            sids = data['sid']
-            gen = model.gen_samples(x.shape, gpu, new_y_chain(gpu,y.shape[0],opt.num_classes), clip_denoised=False).detach().cpu()
-            gen = gen.transpose(1,2).contiguous()
-            x = x.transpose(1,2).contiguous()
+            mids, sids = data['mid'], data['sid']
 
-            gen = gen * s + m  #torch.Size([2, 2048, 3])
-            x = x * s + m
-            for j, pc in enumerate(gen): #torch.Size([2048, 3])
+            gen = model.gen_samples(x.shape, gpu,
+                                    new_y_chain(gpu, y.shape[0], opt.num_classes),
+                                    clip_denoised=False).detach().cpu()
+            gen = gen.transpose(1, 2).contiguous()
+            gen = gen * s + m                              # -> unit-sphere space
+
+            for j, pc in enumerate(gen):
+                if cap and a >= cap:
+                    break
                 points = pc.numpy()
 
                 # The scale chain is already consistent, so do NOT rescale here.
@@ -835,47 +942,25 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
                 gen_radius = float(np.sqrt(
                     ((points - points.mean(axis=0)) ** 2).sum(axis=1)).max())
 
-                point_swc_L1 = L1_medial(points=points, NCenters=2048,iters=1)
-                # Seed fps per-sample so the reconstruction is reproducible.
-                ske = point_swc_L1[fps(point_swc_L1, 1200, seed=opt.manualSeed + a), :] #(1200,3)
-                ###
-                connect = neuron_swc_generator(
-                    ske,
-                    detect_radius=getattr(opt, 'detect_radius', None),
-                    root_cap=getattr(opt, 'root_cap', 2),
-                    gamma_seed=getattr(opt, 'gamma_seed', 1.0),
-                    gamma_main=getattr(opt, 'gamma_main', 1.2),
-                ) #(1200, 7)
-                ###
-                cut = [
-                    {
-                        'n': int(row[0]),
-                        'type': int(row[1]),
-                        'x': row[2],
-                        'y': row[3],
-                        'z': row[4],
-                        'radius': row[5],
-                        'parent': int(row[6])
-                    }
-                    for row in connect
-                ]  #[1200,7]
-                cut = filter_short_branches(
-                    cut, length_threshold=getattr(opt, 'length_threshold', 0.1)) ##[1200,7]
-                cut = pd.DataFrame(cut)
-                nodes = auxi(cut,aux_model)
-
-                # Name by the SOURCE neuron, not by generation order (see manifest note above).
+                # Name by the SOURCE neuron, not by generation order: the dataset
+                # applies a deterministic shuffle (random.Random(38383)), so the
+                # i-th generated sample is NOT the i-th file of the split, and
+                # downstream evaluation pairs against a filename-sorted GT list.
                 mid = mids[j] if isinstance(mids, (list, tuple)) else mids[j]
-                stem = str(mid).replace('/', '__')
-                fname = f"{stem}.swc"
-                file_path = os.path.join(opt.generate_dir, fname)
                 sid = str(sids[j] if isinstance(sids, (list, tuple)) else sids[j])
+                stem = str(mid).replace('/', '__')
+                np.save(os.path.join(cdir, stem + '.npy'), points.astype(np.float32))
+
                 gt_scale_m, gt_centroid = sidecars[(sid, str(mid))]
-                manifest.append({
-                    'file': fname,
+                index.append({
+                    'file': f'{stem}.swc',
+                    'cloud': f'{stem}.npy',
                     'mid': str(mid),
                     'sid': sid,
                     'cate_idx': int(y[j]),
+                    # Seeds the fps draw in the reconstruction phase. Persisted so
+                    # a resumed or parallel reconstruction is bit-identical to a
+                    # serial one.
                     'gen_index': a,
                     # The PAIRED GT neuron's normalisation constants, i.e. S-oracle
                     # input. Named gt_* so using them for the distributional table --
@@ -887,49 +972,125 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
                     # unit-sphere, so a model that has learned the distribution
                     # emits ~1.0; a deviation is a training-health signal, not
                     # a scale to correct for.
-                    'gen_radius': float(gen_radius),
+                    'gen_radius': gen_radius,
                     'mean': [float(v) for v in m[j].flatten()],
                     'std': float(s[j].flatten()[0]),
                 })
-                a = a + 1
-                with open(file_path, 'w') as f:
-                    for node in nodes:
-                        node_str = " ".join(map(str, node))
-                        f.write(node_str + "\n")
+                a += 1
+
+    with open(os.path.join(cdir, 'clouds.json'), 'w') as f:
+        json.dump({'version': 1, 'space': 'unit_sphere', 'model': opt.model,
+                   'max_samples': cap, 'neurons': index}, f, indent=1)
+    print(f'wrote {len(index)} clouds + clouds.json to {cdir}')
+    report_gen_radius(index)
+    return index
+
+
+def report_gen_radius(index):
+    """Cheapest available read on whether the samples are in-distribution at all."""
+    if not index:
+        return
+    radii = np.array([r['gen_radius'] for r in index])
+    print('generated radius (training distribution is exactly 1.0): '
+          'median {:.3g}  p10 {:.3g}  p90 {:.3g}'.format(
+              float(np.median(radii)), float(np.percentile(radii, 10)),
+              float(np.percentile(radii, 90))))
+    if not 0.5 < float(np.median(radii)) < 2.0:
+        warnings.warn(
+            'generated clouds have median radius {:.3g} against a training '
+            'distribution of exactly 1.0 -- the samples are far out of '
+            'distribution, so detect_radius and length_threshold are being '
+            'applied at the wrong scale and the morphometrics are not '
+            'meaningful. Train longer; do not rescale here.'.format(
+                float(np.median(radii))), RuntimeWarning)
+
+
+def reconstruct_clouds(opt, outf_syn):
+    """Phase 2 (CPU, resumable, parallel): clouds -> SWC + the v2 manifest.
+
+    Resumable at neuron granularity: a neuron whose .swc is already on disk is
+    skipped, so an interrupted job restarts where it stopped rather than redoing
+    hours of work. The manifest is rebuilt in full from clouds.json every time, so
+    a resumed run still emits a complete bijection onto the split.
+    """
+    cdir = clouds_dir_for(opt)
+    idx_path = os.path.join(cdir, 'clouds.json')
+    if not os.path.isfile(idx_path):
+        raise SystemExit(
+            f'no {idx_path}; run --stage sample first (or --stage both).')
+    doc = json.load(open(idx_path))
+    index = doc['neurons']
+    if doc.get('space') != 'unit_sphere':
+        raise SystemExit(f'{idx_path} declares space={doc.get("space")!r}; '
+                         'reconstruction is only calibrated for unit_sphere.')
+
+    os.makedirs(opt.generate_dir, exist_ok=True)
+    kw = {'detect_radius': getattr(opt, 'detect_radius', None),
+          'root_cap': getattr(opt, 'root_cap', 2),
+          'gamma_seed': getattr(opt, 'gamma_seed', 1.0),
+          'gamma_main': getattr(opt, 'gamma_main', 1.2),
+          'length_threshold': getattr(opt, 'length_threshold', 0.1)}
+    print('reconstruction settings: %s' % kw)
+
+    todo, done = [], 0
+    for row in index:
+        dest = os.path.join(opt.generate_dir, row['file'])
+        if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+            done += 1
+            continue
+        todo.append((row, (os.path.join(cdir, row['cloud']),
+                           int(opt.manualSeed) + int(row['gen_index']))))
+    if done:
+        print(f'resuming: {done}/{len(index)} already reconstructed, {len(todo)} to go')
+
+    aux_path = aux_model_path(opt)
+    nproc = int(getattr(opt, 'recon_workers', 0) or 0)
+
+    def _write(row, nodes):
+        with open(os.path.join(opt.generate_dir, row['file']), 'w') as f:
+            for node in nodes:
+                f.write(' '.join(map(str, node)) + '\n')
+
+    if nproc > 1 and todo:
+        import multiprocessing as _mp
+        # 'spawn' rather than fork: the parent may hold a CUDA context from the
+        # sampling phase, and forking one is undefined behaviour.
+        ctx = _mp.get_context('spawn')
+        with ctx.Pool(nproc, initializer=_recon_init,
+                      initargs=(aux_path, kw)) as pool:
+            for row, nodes in tqdm(
+                    zip([r for r, _ in todo],
+                        pool.imap(reconstruct_one, [j for _, j in todo], chunksize=1)),
+                    total=len(todo), desc=f'Reconstructing ({nproc} workers)'):
+                _write(row, nodes)
+    else:
+        _recon_init(aux_path, kw)
+        for row, job in tqdm(todo, desc='Reconstructing (serial)'):
+            _write(row, reconstruct_one(job))
 
     # Explicit generated -> source join for the evaluation harness.
     # Envelope, not a bare list: the SWCs on disk are in UNIT-SPHERE coordinates
     # (reconstruction runs there, and scale is restored downstream), so say so
     # explicitly and give the adapter something to assert on rather than infer.
+    manifest = [{k: v for k, v in row.items() if k != 'cloud'} for row in index]
     with open(os.path.join(opt.generate_dir, 'manifest.json'), 'w') as f:
         json.dump({'version': 2,
                    'space': 'unit_sphere',
                    'scale_restored': False,
                    'neurons': manifest}, f, indent=1)
-    print(f"wrote {len(manifest)} neurons + manifest.json to {opt.generate_dir}")
-
-    # Training normalised every neuron to radius exactly 1, so a model that has
-    # learned the distribution emits ~1.0 here. Report it: it is the cheapest
-    # available read on whether the samples are in-distribution at all, and it
-    # is otherwise invisible now that reconstruction renormalises.
-    if manifest:
-        radii = np.array([r['gen_radius'] for r in manifest])
-        print('generated radius (training distribution is exactly 1.0): '
-              'median {:.3g}  p10 {:.3g}  p90 {:.3g}'.format(
-                  float(np.median(radii)), float(np.percentile(radii, 10)),
-                  float(np.percentile(radii, 90))))
-        if not 0.5 < float(np.median(radii)) < 2.0:
-            warnings.warn(
-                'generated clouds have median radius {:.3g} against a training '
-                'distribution of exactly 1.0 -- the samples are far out of '
-                'distribution, so detect_radius and length_threshold are being '
-                'applied at the wrong scale and the morphometrics are not '
-                'meaningful. Train longer; do not rescale here.'.format(
-                    float(np.median(radii))), RuntimeWarning)
-    # BUGFIX: upstream returned `output_dir`, which is not defined in this scope --
-    # a NameError raised AFTER the entire (very expensive) generation loop, discarding
-    # the run. `outf_syn` is the directory this function actually writes under.
+    print(f'wrote {len(manifest)} neurons + manifest.json to {opt.generate_dir}')
+    report_gen_radius(manifest)
     return outf_syn
+
+
+def generate_eval(model, opt, gpu, outf_syn, evaluator):
+    stage = getattr(opt, 'stage', 'both')
+    if stage in ('sample', 'both'):
+        sample_clouds(model, opt, gpu)
+    if stage == 'sample':
+        print('--stage sample: clouds written; run --stage reconstruct next.')
+        return outf_syn
+    return reconstruct_clouds(opt, outf_syn)
 
 
 
@@ -954,7 +1115,11 @@ def _require_dataroot(opt):
                       '-- run tools/swc_to_morphogen_npy.py first')
 
 def main(opt):
-    _require_dataroot(opt)
+    # The reconstruction phase reads clouds off disk and never opens the corpus,
+    # so it must not demand a dataroot -- it is meant to run on a CPU node that
+    # may not even have the baked .npy staged.
+    if getattr(opt, 'stage', 'both') != 'reconstruct':
+        _require_dataroot(opt)
     output_dir = get_output_dir(opt.generate_dir, opt.experiment_name)
     copy_source(__file__, output_dir)
 
@@ -977,6 +1142,13 @@ def test(gpu, opt, output_dir):
         should_diag = True
 
     outf_syn, = setup_output_subdirs(output_dir, 'syn')
+
+    # --stage reconstruct is pure CPU: it reads clouds off disk and never touches
+    # the DDPM. Returning here means the reconstruction job needs no GPU
+    # allocation and no checkpoint -- which is the whole point of the split, since
+    # it is the long half and the cluster's CPU nodes are far easier to get.
+    if getattr(opt, 'stage', 'both') == 'reconstruct':
+        return reconstruct_clouds(opt, outf_syn)
 
     if opt.distribution_type == 'multi':
         if opt.dist_url == "env://" and opt.rank == -1:
@@ -1138,6 +1310,27 @@ def parse_args():
                              'root degree collapses to 1-2 (GT median 7). Calibrated on train, '
                              '0.40 matches the GT median stem count and basal fraction '
                              '-- the MorphoGen+ arm.')
+    # --- Stage 7: sampling and reconstruction are separate phases ------------
+    # Reconstruction is pure-Python CPU at ~4.2 s/neuron and sampling is GPU, so
+    # fusing them (as upstream does) idles the GPU for ~3 hours per checkpoint on
+    # a 2,529-neuron split and loses the whole run if either half dies. The
+    # clouds are persisted between the phases, which also means a tau/gamma
+    # re-sweep costs no GPU at all.
+    parser.add_argument('--stage', default='both',
+                        choices=['sample', 'reconstruct', 'both'],
+                        help="'sample' = DDPM only (GPU, writes clouds/); "
+                             "'reconstruct' = clouds/ -> SWC (CPU, resumable); "
+                             "'both' = one after the other.")
+    parser.add_argument('--clouds_dir', default='',
+                        help='where the raw generated point clouds live. '
+                             'Defaults to <generate_dir>/clouds.')
+    parser.add_argument('--max_samples', type=int, default=0,
+                        help='cap the number of neurons generated (0 = the whole '
+                             'split). The dataloader order is fixed, so a cap '
+                             'yields the SAME subset for every checkpoint -- which '
+                             'is what makes a selection sweep comparable.')
+    parser.add_argument('--recon_workers', type=int, default=0,
+                        help='processes for the reconstruction phase (0 = serial).')
     parser.add_argument('--gamma_main', default=1.2, type=float,
                         help="frontier-edge directional coefficient; the paper's stated gamma.")
     parser.add_argument('--model_dir', type=str, default=r'/mnt/d/hyzhou/point cloud/temp', help='path to save trained model weights')
