@@ -11,7 +11,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --signal=B:TERM@600
 #SBATCH --exclude=tikgpu10
-#CommentSBATCH --nodelist=tikgpu05
+#SBATCH --nodelist=tikgpu05
 #CommentSBATCH --account=tik-internal
 #
 # PICKING A GPU ON A MIXED NODE -- --constraint does NOT do this.
