@@ -76,6 +76,20 @@ def restore_scale_and_clean(nodes, scale_m, centroid, clean_kw=None):
     `nodes` is either the list of 7-tuples `auxi` returns or a DataFrame with
     SWC_COLS. Callers must already have run `filter_short_branches` and `auxi`
     on the unit-sphere tree -- see the ordering contract in the module docstring.
+
+    Why there is no `to_one_indexed` call here, which looks like an omission and is
+    not: `neuron_swc_generator` emits 0-INDEXED output (soma id 0, parent -1, so its
+    children carry parent == 0), which `clean_swc_tree` would shatter into a forest
+    exactly as `to_one_indexed` warns. But `auxi` renumbers on the way through --
+    verified by running the real chain: ids 0..240 with parents {-1, 0, 1, ...} in,
+    ids 1..311 with parents {-1, 1, 2, ...} out. So by the time anything reaches this
+    function the root is the only node with parent <= 0, which is the invariant
+    `clean_swc_tree(root_parent_value=0)` needs.
+
+    The consequence for callers: this function is safe for `auxi` output ONLY. Feed
+    it a raw 0-indexed SWC that has not been through `auxi` -- a corpus file, say --
+    and it will silently return a forest. Use `to_one_indexed` on that path instead,
+    as `recon_ref.py` does for the GT side.
     """
     import pandas as pd
 
