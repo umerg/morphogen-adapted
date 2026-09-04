@@ -181,6 +181,9 @@ def main() -> None:
                          'and, once reconstructed, *.swc')
     ap.add_argument('--clouds-dir', type=Path, default=None,
                     help='override; defaults to <generate-dir>/clouds')
+    ap.add_argument('--trees-dir', type=Path, default=None,
+                    help='where the trees are; defaults to <generate-dir>/trees if '
+                         'that exists (the finalized ones), else <generate-dir>')
     ap.add_argument('--n', type=int, default=8, help='neurons to show')
     ap.add_argument('--pick', default='', help='comma-separated mids, overrides --n')
     ap.add_argument('--out', type=Path, default=Path('panel.png'))
@@ -216,7 +219,18 @@ def main() -> None:
         k = min(args.n, len(index))
         rows = [index[i] for i in np.linspace(0, len(index) - 1, k).astype(int)]
 
-    have_trees = any((args.generate_dir / r['file']).is_file() for r in rows)
+    # Prefer the finalized trees when they exist: after --stage finalize those are the
+    # artefact the metrics actually consume (scale-restored, cleaned, binarised), while
+    # the ones beside the manifest are still unit-sphere and uncleaned at 32 nodes per
+    # branch. Showing the latter would picture a tree nothing is scored on.
+    tdir = args.trees_dir or (args.generate_dir / 'trees')
+    if not any((tdir / r['file']).is_file() for r in rows):
+        tdir = args.generate_dir
+    finalized = tdir != args.generate_dir
+    have_trees = any((tdir / r['file']).is_file() for r in rows)
+    if have_trees:
+        print('trees: %s (%s)' % (tdir, 'finalized' if finalized
+                                  else 'RAW reconstruct output -- run --stage finalize'))
     if not have_trees:
         print('no .swc alongside the clouds -- the tree columns will be empty.\n'
               'Reconstruct them with:\n'
@@ -252,10 +266,11 @@ def main() -> None:
                     draw_cloud(ax, P, f'GT {stem}\nlin {lin:.3f}  nn {nn:.4f}',
                                args.elev, args.azim, '#2ca02c')
                 elif col == 'gen tree':
-                    xyz, par = read_swc(args.generate_dir / row['file'])
+                    xyz, par = read_swc(tdir / row['file'])
                     s = tree_stats(xyz, par)
                     draw_tree(ax, xyz, par,
-                              'recon  n {nodes}  lv {leaves}  '
+                              ('final' if finalized else 'raw') +
+                              '  n {nodes}  lv {leaves}  '
                               'k {root_deg}  ord {max_order}'.format(**s),
                               args.elev, args.azim, '#111111')
                 else:
