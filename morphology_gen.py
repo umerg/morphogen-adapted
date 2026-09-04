@@ -1172,7 +1172,12 @@ def finalize_trees(opt):
     rather than being tuned away.
     """
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from tools.morphogen_swc import restore_scale_and_clean
+    from tools.morphogen_swc import restore_scale_and_clean, _clean_swc_tree
+
+    # Resolve dendrite_gen NOW, not on the first neuron. Same reason sample_clouds
+    # preloads its sidecars: a missing dependency should surface in the first second,
+    # not after the scale pool is fitted and a progress bar has appeared.
+    _clean_swc_tree()
 
     src = opt.generate_dir
     man_path = os.path.join(src, 'manifest.json')

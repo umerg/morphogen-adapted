@@ -54,7 +54,20 @@ def _clean_swc_tree():
     `python morphology_gen.py` on any machine without dendrite_gen present --
     and generation itself never cleans. Override the location with DENDRITE_GEN.
     """
-    dg = Path(os.environ.get('DENDRITE_GEN', Path.home() / 'Documents' / 'dendrite_gen'))
+    env = os.environ.get('DENDRITE_GEN')
+    dg = Path(env) if env else Path.home() / 'Documents' / 'dendrite_gen'
+    # Check before inserting. Pushing a non-existent path onto sys.path and letting
+    # the import fail produces `No module named 'preprocessing'`, which names neither
+    # the real problem nor the variable that fixes it -- and the default only ever
+    # resolves on a dev laptop, so this is the first thing that breaks on a cluster.
+    if not (dg / 'preprocessing' / 'clean_trees.py').is_file():
+        raise SystemExit(
+            'cannot reach dendrite_gen: no preprocessing/clean_trees.py under %s%s\n'
+            '  clean_swc_tree must be dendrite_gen\'s own -- generated trees have to be\n'
+            '  simplified by the SAME call the training corpus went through, so it is\n'
+            '  imported rather than vendored.\n'
+            '  Fix: export DENDRITE_GEN=/path/to/dendrite_gen'
+            % (dg, '' if env else ' (DENDRITE_GEN unset, using the default)'))
     if str(dg) not in sys.path:
         sys.path.insert(0, str(dg))
     from preprocessing.clean_trees import clean_swc_tree
