@@ -1243,7 +1243,7 @@ def finalize_trees(opt):
     print('  nodes/tree: median %.0f  p10 %.0f  p90 %.0f'
           % (float(np.median(n)), float(np.percentile(n, 10)),
              float(np.percentile(n, 90))))
-    print('  score with: run_dist_metrics_cli.py --pred-dir %s' % dst)
+    print('  score with: tools/score_trees.py --pred-dir %s' % dst)
     return dst
 
 
