@@ -19,7 +19,10 @@ from models.dit3d import DiT3D_models
 from utils.misc import Evaluator
 import numpy as np
 import warnings
+import glob
 import json
+import sys
+import zlib
 from scipy.spatial import distance_matrix, KDTree
 from utils.ske_connect import *
 import heapq
@@ -857,6 +860,10 @@ def clouds_dir_for(opt):
     return getattr(opt, 'clouds_dir', '') or os.path.join(opt.generate_dir, 'clouds')
 
 
+def trees_dir_for(opt):
+    return getattr(opt, 'trees_dir', '') or os.path.join(opt.generate_dir, 'trees')
+
+
 def sample_clouds(model, opt, gpu):
     """Phase 1 (GPU): DDPM ancestral sampling -> one .npy per neuron + an index.
 
@@ -1083,14 +1090,180 @@ def reconstruct_clouds(opt, outf_syn):
     return outf_syn
 
 
+def _scale_pool(train_synset_dir):
+    """Empirical p_hat(m): every per-neuron scale in the TRAIN split.
+
+    `pc_normlize` returned (points, centroid, m) but the .npy kept only the points,
+    so m lives in the bake sidecars. Resampling this pool is non-parametric on
+    purpose -- the corpus scale distribution is wide and skewed (80.9-985.8 um,
+    median 244.3), so a fitted Gaussian or log-normal would put mass where no neuron
+    is. TRAIN only: fitting on val leaks the evaluation split into the very metrics
+    being computed.
+    """
+    metas = sorted(glob.glob(os.path.join(train_synset_dir, '*.meta.json')))
+    if not metas:
+        raise SystemExit(
+            f'no *.meta.json under {train_synset_dir} -- --scale_mode marginal needs '
+            'the bake sidecars. Point --train_npy_root at the SYNSET dir '
+            '(e.g. <bake>/neurons).')
+    pool = []
+    for m in metas:
+        with open(m) as fh:
+            v = json.load(fh).get('scale_m')
+        if v is None:
+            raise SystemExit(f'{m} has no scale_m; the bake predates the sidecar contract')
+        pool.append(float(v))
+    return np.asarray(pool, dtype=float)
+
+
+def _draw_scale(pool, stem, seed):
+    """One draw from p_hat(m), keyed on the neuron's own name.
+
+    Keyed rather than sequential so a neuron gets the same scale in an N-capped
+    selection subset as in the full split -- otherwise a selection sweep and the
+    headline table would disagree about the same sample. crc32, not hash():
+    PYTHONHASHSEED randomises str hashing per process.
+    """
+    rng = np.random.default_rng(zlib.crc32(stem.encode()) ^ int(seed))
+    return float(pool[rng.integers(len(pool))])
+
+
+def finalize_trees(opt):
+    """Phase 3 (CPU, cheap): reconstruction output -> the trees we actually compare.
+
+    `--stage reconstruct` stops at `auxi`, so its SWCs are unit-sphere, unrestored and
+    UNCLEANED -- 32 nodes per branch, which is not what any metric here assumes.
+    dendrite_gen's metrics take critical skeletons (`validation/structural_metrics.py`
+    says so outright), and feeding dense reconstructions straight in corrupts
+    branch_length (inter-sample-point distances, not branch lengths),
+    bifurcation_angle (the child vector points at a sample ~1 um away rather than
+    along the branch), node_count, contraction and Sholl AUC.
+
+    So this stage does the last two steps of the chain and writes the comparable
+    artefact:
+
+        restore scale  ->  clean_swc_tree  ->  binarised critical skeleton
+
+    ORDER IS FIXED. The restore must come after `filter_short_branches` and `auxi`,
+    which are calibrated in unit-sphere units -- at a typical scale_m of ~180 um,
+    length_threshold 0.30 would otherwise prune at 0.30 um instead of ~54 um, i.e.
+    nothing. `clean_swc_tree` itself is scale-equivariant (verified at k in
+    {1, 177.1, 1e4}: identical topology, coordinates matching k* to ~1e-16), so its
+    position relative to the restore is convention, not correctness.
+
+    SCALE SOURCE is a measurement decision, not a detail, hence a flag. Scale is not
+    "lost" in MorphoGen, it is ABSENT BY CONSTRUCTION: pc_normlize divides every baked
+    neuron by its own max radial norm, so the training corpus has exactly zero scale
+    variance and the model learned p(shape | radius = 1). Restoring it is a post-hoc
+    add-on either way; the only question is whether the number comes from the corpus
+    or from the answer sheet.
+
+      marginal (default) -- resample m from the TRAIN split. The mode for the
+        distributional table.
+      oracle             -- the paired GT neuron's gt_scale_m. Hands the baseline a
+        quantity we measured for it, so it is valid only for metrics that already
+        consume GT pairing, never for the distributional table.
+
+    Five of the nine MORPHO_KEYS are scale-dependent (axial_extent, radial_span,
+    mean_branch_length, mean_radial_to_root, sholl_critical_radius), so the choice
+    moves over half the headline vector. Under marginal, expect mean_branch_length to
+    be penalised: resampling destroys the true shape-scale correlation. That penalty
+    is REAL -- a consequence of per-shape normalisation -- and belongs in the write-up
+    rather than being tuned away.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from tools.morphogen_swc import restore_scale_and_clean
+
+    src = opt.generate_dir
+    man_path = os.path.join(src, 'manifest.json')
+    if not os.path.isfile(man_path):
+        raise SystemExit(f'no {man_path}; run --stage reconstruct first.')
+    doc = json.load(open(man_path))
+    if doc.get('scale_restored'):
+        raise SystemExit(f'{man_path} is already scale-restored; --stage finalize '
+                         'expects raw reconstruction output.')
+    rows = doc['neurons']
+
+    mode = getattr(opt, 'scale_mode', 'marginal')
+    pool = None
+    if mode == 'marginal':
+        root = getattr(opt, 'train_npy_root', '')
+        if not root:
+            if not opt.dataroot:
+                raise SystemExit(
+                    '--scale_mode marginal needs the train sidecars: pass '
+                    '--train_npy_root <bake>/neurons (or --dataroot, from which it '
+                    'is derived). Use --scale_mode oracle only for paired metrics.')
+            root = os.path.join(opt.dataroot, opt.category.split(',')[0])
+        pool = _scale_pool(os.path.join(root, 'train'))
+        print('scale: marginal, resampled from %d train neurons '
+              '(median %.1f um, p10 %.1f, p90 %.1f), seed %d'
+              % (len(pool), float(np.median(pool)), float(np.percentile(pool, 10)),
+                 float(np.percentile(pool, 90)), opt.scale_seed))
+    else:
+        # Loud, because a table built on this scores the baseline on a number we
+        # handed it and nothing downstream can tell that happened.
+        print('scale: ORACLE (paired GT gt_scale_m). Valid for paired metrics only; '
+              'NOT for the distributional table.')
+
+    dst = trees_dir_for(opt)
+    os.makedirs(dst, exist_ok=True)
+    out_rows = []
+    for row in tqdm(rows, desc='Finalizing trees'):
+        stem = str(row['mid']).split('/')[-1]
+        raw = np.loadtxt(os.path.join(src, row['file']), comments='#', ndmin=2)
+        df = pd.DataFrame(raw[:, :7], columns=['id', 'type', 'x', 'y', 'z',
+                                               'radius', 'parent'])
+        if pool is None:
+            m, c = row['gt_scale_m'], row['gt_centroid']
+        else:
+            # Zero centroid, not the paired GT's: under marginal no GT-derived
+            # quantity may reach the output at all. This moves no metric -- the cloud
+            # is already centred by pc_normlize and load_swc_graph root-centres both
+            # sides -- it only closes the leak.
+            m, c = _draw_scale(pool, stem, opt.scale_seed), [0.0, 0.0, 0.0]
+        clean = restore_scale_and_clean(df, m, c)
+        with open(os.path.join(dst, row['file']), 'w') as fh:
+            for r in clean.itertuples(index=False):
+                fh.write('%d %d %.6f %.6f %.6f %.6f %d\n'
+                         % (int(r.id), int(r.type), float(r.x), float(r.y),
+                            float(r.z), float(r.radius), int(r.parent)))
+        out_rows.append(dict(row, applied_scale_m=float(m), nodes=int(len(clean))))
+
+    manifest = {'version': 3, 'space': 'um', 'scale_restored': True, 'cleaned': True,
+                'scale_mode': mode,
+                'scale_seed': int(opt.scale_seed) if pool is not None else None,
+                'scale_pool_n': int(len(pool)) if pool is not None else None,
+                'clean_kw': 'prepare_conditional_dataset.py:96',
+                'neurons': out_rows}
+    with open(os.path.join(dst, 'manifest.json'), 'w') as f:
+        json.dump(manifest, f, indent=1)
+    n = np.array([r['nodes'] for r in out_rows], dtype=float)
+    print('wrote %d cleaned trees + manifest.json to %s' % (len(out_rows), dst))
+    print('  nodes/tree: median %.0f  p10 %.0f  p90 %.0f'
+          % (float(np.median(n)), float(np.percentile(n, 10)),
+             float(np.percentile(n, 90))))
+    print('  score with: run_dist_metrics_cli.py --pred-dir %s' % dst)
+    return dst
+
+
 def generate_eval(model, opt, gpu, outf_syn, evaluator):
     stage = getattr(opt, 'stage', 'both')
+    if stage == 'finalize':
+        finalize_trees(opt)
+        return outf_syn
     if stage in ('sample', 'both'):
         sample_clouds(model, opt, gpu)
     if stage == 'sample':
         print('--stage sample: clouds written; run --stage reconstruct next.')
         return outf_syn
-    return reconstruct_clouds(opt, outf_syn)
+    reconstruct_clouds(opt, outf_syn)
+    if stage == 'reconstruct':
+        print('--stage reconstruct: UNIT-SPHERE, UNCLEANED trees written. These are '
+              'not yet comparable -- run --stage finalize next.')
+        return outf_syn
+    finalize_trees(opt)
+    return outf_syn
 
 
 
@@ -1115,10 +1288,12 @@ def _require_dataroot(opt):
                       '-- run tools/swc_to_morphogen_npy.py first')
 
 def main(opt):
-    # The reconstruction phase reads clouds off disk and never opens the corpus,
-    # so it must not demand a dataroot -- it is meant to run on a CPU node that
-    # may not even have the baked .npy staged.
-    if getattr(opt, 'stage', 'both') != 'reconstruct':
+    # The reconstruction and finalize phases read off disk and never open the
+    # corpus, so they must not demand a dataroot -- they are meant to run on a CPU
+    # node that may not even have the baked .npy staged. finalize does need the
+    # train SIDECARS under --scale_mode marginal, but those are .meta.json and are
+    # checked by _scale_pool, which reports the real problem.
+    if getattr(opt, 'stage', 'both') not in ('reconstruct', 'finalize'):
         _require_dataroot(opt)
     output_dir = get_output_dir(opt.generate_dir, opt.experiment_name)
     copy_source(__file__, output_dir)
@@ -1149,6 +1324,13 @@ def test(gpu, opt, output_dir):
     # it is the long half and the cluster's CPU nodes are far easier to get.
     if getattr(opt, 'stage', 'both') == 'reconstruct':
         return reconstruct_clouds(opt, outf_syn)
+
+    # Same for finalize: it restores scale and cleans SWCs already on disk, so it
+    # needs neither a GPU nor a checkpoint. Cheapest stage in the pipeline, and the
+    # one you re-run when only the scale mode changes.
+    if getattr(opt, 'stage', 'both') == 'finalize':
+        finalize_trees(opt)
+        return outf_syn
 
     if opt.distribution_type == 'multi':
         if opt.dist_url == "env://" and opt.rank == -1:
@@ -1326,10 +1508,28 @@ def parse_args():
     # clouds are persisted between the phases, which also means a tau/gamma
     # re-sweep costs no GPU at all.
     parser.add_argument('--stage', default='both',
-                        choices=['sample', 'reconstruct', 'both'],
+                        choices=['sample', 'reconstruct', 'finalize', 'both'],
                         help="'sample' = DDPM only (GPU, writes clouds/); "
-                             "'reconstruct' = clouds/ -> SWC (CPU, resumable); "
-                             "'both' = one after the other.")
+                             "'reconstruct' = clouds/ -> unit-sphere UNCLEANED SWC "
+                             "(CPU, resumable); 'finalize' = restore scale + "
+                             "clean_swc_tree -> trees/, the artefact metrics consume; "
+                             "'both' = the whole pipeline, all three.")
+    parser.add_argument('--trees_dir', default='',
+                        help='where --stage finalize writes the cleaned trees. '
+                             'Defaults to <generate_dir>/trees.')
+    parser.add_argument('--scale_mode', choices=('marginal', 'oracle'),
+                        default='marginal',
+                        help="marginal (default): resample m from the train split -- "
+                             "the mode for the distributional table. oracle: the "
+                             "paired GT neuron's gt_scale_m, for paired metrics only. "
+                             "See finalize_trees.__doc__.")
+    parser.add_argument('--train_npy_root', default='',
+                        help='bake SYNSET dir whose train/ sidecars supply p_hat(m) '
+                             'for --scale_mode marginal. Defaults to '
+                             '<dataroot>/<category>.')
+    parser.add_argument('--scale_seed', type=int, default=0,
+                        help='seed for the marginal scale draw; recorded in the '
+                             'output manifest.')
     parser.add_argument('--clouds_dir', default='',
                         help='where the raw generated point clouds live. '
                              'Defaults to <generate_dir>/clouds.')

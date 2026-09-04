@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """Materialise the GT directory matching a generated subset.
 
-`--max_samples N` generates a fixed prefix of the split, so the manifest names N
-source neurons out of a larger val set. The adapter
-(`dendrite_gen/visualization/convert_morphogen_to_pred_pkl.py`) asserts a bijection
-onto whatever `--gt-dir` holds and refuses to drop or pad -- deliberately, because
-silently skipping neurons is quality-correlated selection. This builds a GT
-directory containing exactly the manifest's neurons so that assert stays meaningful
-instead of being relaxed.
+`--max_samples N` generates a fixed prefix of the split, so a run holds N neurons out
+of a larger val set. Scoring those against the full GT directory compares unequal N,
+and MMD / coverage / density all carry N-dependent finite-sample bias --
+`run_dist_metrics_cli.py` warns about it but cannot fix it. This builds a GT
+directory containing exactly the run's neurons so the comparison is N-matched.
 
     python tools/gt_subset.py \
         --manifest /scratch/guptau/mg_gen/armS690_c0_bs112/clouds/clouds.json \
